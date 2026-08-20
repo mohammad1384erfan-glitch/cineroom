@@ -18,13 +18,16 @@ export class SupabaseRealtimeService implements RealtimeService {
   }
 
   private initClient() {
-    const url = import.meta.env.VITE_SUPABASE_URL;
+    let url = import.meta.env.VITE_SUPABASE_URL;
     const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
     if (!url || !anonKey || url.includes('your-project-id')) {
       logger.error('Supabase configuration missing or invalid. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.');
       this.supabase = null;
     } else {
+      // Clean up URL if it has a trailing /rest/v1 or /rest/v1/ suffix
+      url = url.replace(/\/rest\/v1\/?$/, '');
+
       this.supabase = createClient(url, anonKey, {
         auth: {
           persistSession: true
