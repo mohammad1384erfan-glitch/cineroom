@@ -4,7 +4,7 @@ import {
   Film, Copy, Check, LogOut, Play, Pause, 
   Terminal, Users, FolderOpen, Send, 
   Crown, Wifi, Mic, MicOff, Plus, Trash2, ArrowUp, ArrowDown, Minimize2, Maximize2,
-  Lock, Unlock, MessageSquare, PlaySquare, Shield, RefreshCw, Smile
+  Lock, Unlock, MessageSquare, PlaySquare, Shield, RefreshCw, Smile, AlertTriangle
 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
@@ -102,6 +102,17 @@ const convertSrtToVtt = (srtContent: string): string => {
   return vtt;
 };
 
+const getAparatVideoId = (url: string): string | null => {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname.includes('aparat.com')) {
+      const match = parsed.pathname.match(/\/v\/([a-zA-Z0-9]+)/);
+      if (match) return match[1];
+    }
+  } catch (_) {}
+  return null;
+};
+
 const validateVideoUrl = (url: string): Promise<void> => {
   return new Promise((resolve, reject) => {
     try {
@@ -132,14 +143,26 @@ const validateVideoUrl = (url: string): Promise<void> => {
       tempVideo.src = '';
       tempVideo.load();
       const err = tempVideo.error;
+      const isDirectMedia = /\.(mp4|webm|ogg|ogv|mov|m4v|m3u8|mpd)($|\?)/i.test(url);
+      
       if (err) {
         if (err.code === 1) reject(new Error('Video loading aborted.'));
         else if (err.code === 2) reject(new Error('Network error: Unable to download video.'));
         else if (err.code === 3) reject(new Error('Decode error: The video codec or container is not supported by your browser.'));
-        else if (err.code === 4) reject(new Error('Format error: The video is not playable. This is usually due to CORS restrictions or an invalid MIME type.'));
+        else if (err.code === 4) {
+          if (!isDirectMedia) {
+            reject(new Error('The URL you entered is not a direct video stream. If this is a platform video (like Aparat), please load it via the Supported Platforms tab. Otherwise, make sure to enter a direct URL ending in .mp4 or .webm.'));
+          } else {
+            reject(new Error('Format error: The video is not playable. This is usually due to CORS restrictions or an invalid MIME type.'));
+          }
+        }
         else reject(new Error('Failed to load video source. Please verify the URL and CORS permissions.'));
       } else {
-        reject(new Error('Failed to load video. This URL may require authentication or have CORS block.'));
+        if (!isDirectMedia) {
+          reject(new Error('The URL you entered is not a direct video stream. If this is a platform video (like Aparat), please load it via the Supported Platforms tab. Otherwise, make sure to enter a direct URL ending in .mp4 or .webm.'));
+        } else {
+          reject(new Error('Failed to load video. This URL may require authentication or have CORS block.'));
+        }
       }
     };
   });
@@ -172,6 +195,8 @@ export const Room: React.FC = () => {
   const [videoTitle, setVideoTitle] = useState('');
   const [chatInput, setChatInput] = useState('');
   const [showChangeVideoForm, setShowChangeVideoForm] = useState(false);
+  const [activeLoaderTab, setActiveLoaderTab] = useState<'local' | 'url' | 'platforms'>('url');
+  const [aparatUrl, setAparatUrl] = useState('');
   const [activeTab, setActiveTab] = useState<'chat' | 'members' | 'queue'>('chat');
   const [isCinemaMode, setIsCinemaMode] = useState(false);
   const [showPermissionsModal, setShowPermissionsModal] = useState(false);
@@ -446,25 +471,73 @@ export const Room: React.FC = () => {
     }
   };  const handleLoadUrlVideo = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!directUrl.trim()) return;
+    const url = directUrl.trim();
+    if (!url) return;
 
-    const title = videoTitle.trim() || directUrl.split('/').pop() || 'Direct Video Stream';
     setIsUrlLoading(true);
 
     try {
-      await validateVideoUrl(directUrl.trim());
+      const aparatId = getAparatVideoId(url);
+      if (aparatId) {
+        await store.updatePlayback({
+          sourceType: 'aparat',
+          sourceUrl: url,
+          fileName: `Aparat Video (${aparatId})`,
+          fileSize: 0,
+          isPlaying: false,
+          playing: false,
+          currentTime: 0,
+          videoId: aparatId
+        });
+        setDirectUrl('');
+        setVideoTitle('');
+      } else {
+        const title = videoTitle.trim() || url.split('/').pop() || 'Direct Video Stream';
+        await validateVideoUrl(url);
+        await store.updatePlayback({
+          sourceType: 'url',
+          sourceUrl: url,
+          fileName: title,
+          fileSize: 0,
+          isPlaying: false,
+          playing: false,
+          currentTime: 0,
+          videoId: url
+        });
+        setDirectUrl('');
+        setVideoTitle('');
+      }
+    } catch (err: any) {
+      alert(err.message);
+    } finally {
+      setIsUrlLoading(false);
+    }
+  };
+
+  const handleLoadAparatVideo = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const url = aparatUrl.trim();
+    if (!url) return;
+
+    const aparatId = getAparatVideoId(url);
+    if (!aparatId) {
+      alert('Unsupported platform URL. Please enter a valid Aparat video URL (e.g., https://www.aparat.com/v/yjn9e79).');
+      return;
+    }
+
+    setIsUrlLoading(true);
+    try {
       await store.updatePlayback({
-        sourceType: 'url',
-        sourceUrl: directUrl.trim(),
-        fileName: title,
+        sourceType: 'aparat',
+        sourceUrl: url,
+        fileName: `Aparat Video (${aparatId})`,
         fileSize: 0,
         isPlaying: false,
         playing: false,
         currentTime: 0,
-        videoId: directUrl.trim()
+        videoId: aparatId
       });
-      setDirectUrl('');
-      setVideoTitle('');
+      setAparatUrl('');
     } catch (err: any) {
       alert(err.message);
     } finally {
@@ -1044,7 +1117,14 @@ export const Room: React.FC = () => {
             {store.playbackState.fileName ? (
               // Video element exists
               <div className="w-full h-full relative group bg-black">
-                {store.playbackState.sourceType === 'url' || store.playbackState.sourceType === 'local' ? (
+                {store.playbackState.sourceType === 'aparat' ? (
+                  <iframe
+                    src={`https://www.aparat.com/video/video/embed/videohash/${store.playbackState.videoId}/vt/frame`}
+                    className="w-full h-full border-0 bg-zinc-950"
+                    allowFullScreen
+                    allow="autoplay; encrypted-media"
+                  />
+                ) : store.playbackState.sourceType === 'url' || store.playbackState.sourceType === 'local' ? (
                   <>
                     <video 
                       ref={videoElementRef}
@@ -1276,6 +1356,16 @@ export const Room: React.FC = () => {
           <Card className="p-4 bg-zinc-950/50 backdrop-blur-sm border border-glass">
             <div className="flex flex-col gap-4">
               
+              {/* Aparat warning banner */}
+              {store.playbackState.sourceType === 'aparat' && (
+                <div className="flex items-center gap-2.5 bg-yellow-500/10 border border-yellow-500/20 text-yellow-500 px-3 py-2.5 rounded-lg text-xs leading-normal select-none">
+                  <AlertTriangle size={15} className="shrink-0 text-yellow-500" />
+                  <span>
+                    <strong>Platform Embedded Video (Aparat):</strong> Play/pause/seek synchronization is limited for platform-embedded videos. Please use the control bar inside the video screen directly.
+                  </span>
+                </div>
+              )}
+
               {/* Seeker line */}
               <div className="flex items-center gap-3">
                 <span className="text-[10px] text-zinc-500 font-bold font-mono">{formatTime(localCurrentTime)}</span>
@@ -1288,8 +1378,8 @@ export const Room: React.FC = () => {
                   onChange={handleSeekChange}
                   onMouseUp={handleSeekEnd}
                   onTouchEnd={handleSeekEnd}
-                  disabled={!isHost && !selfParticipant?.permissions.canSeek}
-                  className="flex-1 h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-brand-primary focus:outline-none"
+                  disabled={store.playbackState.sourceType === 'aparat' || (!isHost && !selfParticipant?.permissions.canSeek)}
+                  className="flex-1 h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-brand-primary focus:outline-none disabled:opacity-30 disabled:pointer-events-none"
                 />
                 <span className="text-[10px] text-zinc-500 font-bold font-mono">{formatTime(videoDuration)}</span>
               </div>
@@ -1303,9 +1393,9 @@ export const Room: React.FC = () => {
                     variant={store.playbackState.playing ? 'outline' : 'primary'}
                     size="md" 
                     onClick={handleTogglePlay}
-                    disabled={!isHost && !selfParticipant?.permissions.canPlayPause}
-                    className="w-10 h-10 rounded-lg flex items-center justify-center p-0"
-                    title={store.playbackState.playing ? 'Pause' : 'Play'}
+                    disabled={store.playbackState.sourceType === 'aparat' || (!isHost && !selfParticipant?.permissions.canPlayPause)}
+                    className="w-10 h-10 rounded-lg flex items-center justify-center p-0 disabled:opacity-30 disabled:pointer-events-none"
+                    title={store.playbackState.sourceType === 'aparat' ? 'Platform Embedded Player (Use player controls inside video)' : (store.playbackState.playing ? 'Pause' : 'Play')}
                   >
                     {store.playbackState.playing ? <Pause size={16} /> : <Play size={16} />}
                   </Button>
@@ -1398,47 +1488,93 @@ export const Room: React.FC = () => {
                   
                   if (!isVideoLoaded || showChangeVideoForm) {
                     return (
-                      <div className="flex flex-wrap items-center gap-3">
-                        <form onSubmit={handleLoadUrlVideo} className="flex items-center gap-2">
-                          <input 
-                            type="url"
-                            placeholder={isUrlLoading ? "Verifying URL..." : "Load Direct HTTP URL (MP4)"}
-                            value={directUrl}
-                            onChange={(e) => setDirectUrl(e.target.value)}
-                            disabled={isUrlLoading}
-                            className="px-3 py-1.5 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none w-48 text-brand-text-main disabled:opacity-50"
-                          />
-                          <input 
-                            type="text"
-                            placeholder="Video Title (Optional)"
-                            value={videoTitle}
-                            onChange={(e) => setVideoTitle(e.target.value)}
-                            disabled={isUrlLoading}
-                            className="px-3 py-1.5 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none w-32 text-brand-text-main disabled:opacity-50"
-                          />
-                          <Button variant="secondary" size="sm" type="submit" isLoading={isUrlLoading}>
-                            Load
-                          </Button>
-                        </form>
+                      <div className="flex flex-col gap-3 w-full border-t border-glass pt-4 mt-1">
+                        <div className="flex flex-wrap items-center gap-1.5 border-b border-glass pb-1">
+                          <button
+                            type="button"
+                            onClick={() => setActiveLoaderTab('url')}
+                            className={`px-3 py-1.5 text-[10px] font-bold uppercase rounded-t-lg transition-colors duration-200 ${activeLoaderTab === 'url' ? 'bg-white/10 text-white border-b-2 border-brand-primary' : 'text-zinc-500 hover:text-zinc-300'}`}
+                          >
+                            Direct URL
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setActiveLoaderTab('platforms')}
+                            className={`px-3 py-1.5 text-[10px] font-bold uppercase rounded-t-lg transition-colors duration-200 ${activeLoaderTab === 'platforms' ? 'bg-white/10 text-white border-b-2 border-brand-primary' : 'text-zinc-500 hover:text-zinc-300'}`}
+                          >
+                            Supported Platforms
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setActiveLoaderTab('local')}
+                            className={`px-3 py-1.5 text-[10px] font-bold uppercase rounded-t-lg transition-colors duration-200 ${activeLoaderTab === 'local' ? 'bg-white/10 text-white border-b-2 border-brand-primary' : 'text-zinc-500 hover:text-zinc-300'}`}
+                          >
+                            Local File
+                          </button>
+                          {isVideoLoaded && (
+                            <Button variant="ghost" size="sm" onClick={() => setShowChangeVideoForm(false)} className="ml-auto">
+                              Cancel
+                            </Button>
+                          )}
+                        </div>
 
-                        <label className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-glass bg-brand-bg-card hover:bg-brand-bg-input text-xs cursor-pointer text-brand-text-muted hover:text-white transition-colors duration-200">
-                          <FolderOpen size={13} />
-                          <span>Host Local File</span>
-                          <input 
-                            type="file" 
-                            accept="video/*" 
-                            onChange={handleLocalFileSelect}
-                            className="hidden" 
-                          />
-                        </label>
-                        {isVideoLoaded && (
-                          <Button variant="ghost" size="sm" onClick={() => setShowChangeVideoForm(false)}>
-                            Cancel
-                          </Button>
+                        {activeLoaderTab === 'url' && (
+                          <form onSubmit={handleLoadUrlVideo} className="flex flex-wrap items-center gap-2 animate-fade-in">
+                            <input 
+                              type="url"
+                              placeholder={isUrlLoading ? "Verifying URL..." : "Load Direct HTTP URL (MP4/WebM)"}
+                              value={directUrl}
+                              onChange={(e) => setDirectUrl(e.target.value)}
+                              disabled={isUrlLoading}
+                              className="px-3 py-1.5 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none w-56 text-brand-text-main disabled:opacity-50"
+                            />
+                            <input 
+                              type="text"
+                              placeholder="Video Title (Optional)"
+                              value={videoTitle}
+                              onChange={(e) => setVideoTitle(e.target.value)}
+                              disabled={isUrlLoading}
+                              className="px-3 py-1.5 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none w-32 text-brand-text-main disabled:opacity-50"
+                            />
+                            <Button variant="secondary" size="sm" type="submit" isLoading={isUrlLoading}>
+                              Load
+                            </Button>
+                          </form>
                         )}
-                        <span className="text-[9px] text-zinc-500 max-w-[280px] leading-normal block italic select-none">
-                          ⚠️ Local videos stream directly from the Host's device. Quality matches the Host's upload bandwidth and network stability.
-                        </span>
+
+                        {activeLoaderTab === 'platforms' && (
+                          <form onSubmit={handleLoadAparatVideo} className="flex flex-wrap items-center gap-2 animate-fade-in">
+                            <input 
+                              type="url"
+                              placeholder="Aparat URL (https://www.aparat.com/v/yjn9e79)"
+                              value={aparatUrl}
+                              onChange={(e) => setAparatUrl(e.target.value)}
+                              disabled={isUrlLoading}
+                              className="px-3 py-1.5 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none w-72 text-brand-text-main disabled:opacity-50"
+                            />
+                            <Button variant="secondary" size="sm" type="submit" isLoading={isUrlLoading}>
+                              Load Aparat Embed
+                            </Button>
+                          </form>
+                        )}
+
+                        {activeLoaderTab === 'local' && (
+                          <div className="flex flex-wrap items-center gap-3 animate-fade-in">
+                            <label className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-glass bg-brand-bg-card hover:bg-brand-bg-input text-xs cursor-pointer text-brand-text-muted hover:text-white transition-colors duration-200">
+                              <FolderOpen size={13} />
+                              <span>Host Local File</span>
+                              <input 
+                                type="file" 
+                                accept="video/*" 
+                                onChange={handleLocalFileSelect}
+                                className="hidden" 
+                              />
+                            </label>
+                            <span className="text-[9px] text-zinc-500 max-w-[280px] leading-normal block italic select-none">
+                              ⚠️ Local videos stream directly from the Host's device. Quality matches the Host's upload bandwidth and network stability.
+                            </span>
+                          </div>
+                        )}
                       </div>
                     );
                   }

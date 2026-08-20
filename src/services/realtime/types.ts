@@ -1,4 +1,4 @@
-export type VideoSourceType = 'url' | 'local';
+export type VideoSourceType = 'url' | 'local' | 'aparat';
 
 export interface UserPermissions {
   canPlayPause: boolean;
