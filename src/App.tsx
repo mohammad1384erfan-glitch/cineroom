@@ -4,11 +4,11 @@ import { router } from './router';
 import { useRoomStore } from './store/useRoomStore';
 
 export const App: React.FC = () => {
-  const store = useRoomStore();
+  const restoreSession = useRoomStore(state => state.restoreSession);
 
   useEffect(() => {
     // Check if a saved watchroom session exists to auto-restore
-    store.restoreSession().then((restored) => {
+    restoreSession().then((restored) => {
       if (restored) {
         const activeRoom = useRoomStore.getState().room;
         if (activeRoom) {
@@ -20,7 +20,7 @@ export const App: React.FC = () => {
         }
       }
     });
-  }, [store]);
+  }, [restoreSession]);
 
   return <RouterProvider router={router} />;
 };
