@@ -47,6 +47,8 @@ interface RoomState {
   p2pObjectUrl: string | null;
   isP2PBuffering: boolean;
   p2pActiveFileId: string | null;
+  p2pSubtitleName: string | null;
+  p2pSubtitleUrl: string | null;
 
   // Premium stats tracking
   sessionStats: SessionStats;
@@ -75,7 +77,8 @@ interface RoomState {
   removeFromQueue: (itemId: string) => Promise<void>;
   reorderQueue: (queue: QueueItem[]) => Promise<void>;
   clearQueue: () => Promise<void>;
-  startStreamingFile: (file: File) => Promise<void>;
+  startStreamingFile: (file: File | null) => Promise<void>;
+  removeVideo: () => Promise<void>;
   updateRoomSettings: (settings: Partial<Room>) => Promise<void>;
   updateParticipantPermissions: (targetId: string, permissions: UserPermissions) => Promise<void>;
   removeParticipant: (targetId: string) => Promise<void>;
@@ -149,6 +152,8 @@ export const useRoomStore = create<RoomState>((set, get) => {
     p2pObjectUrl: null,
     isP2PBuffering: false,
     p2pActiveFileId: null,
+    p2pSubtitleName: null,
+    p2pSubtitleUrl: null,
 
     // Premium stats tracking
     isWatchPartyFinished: false,
@@ -238,6 +243,11 @@ export const useRoomStore = create<RoomState>((set, get) => {
         realtimeService.clearListeners();
         webrtcService.close();
         
+        const oldSubUrl = get().p2pSubtitleUrl;
+        if (oldSubUrl) {
+          URL.revokeObjectURL(oldSubUrl);
+        }
+        
         set({
           room: null,
           participants: [],
@@ -249,7 +259,9 @@ export const useRoomStore = create<RoomState>((set, get) => {
           error: null,
           webrtcPeers: [],
           isLocalMuted: false,
-          floatingReactions: []
+          floatingReactions: [],
+          p2pSubtitleName: null,
+          p2pSubtitleUrl: null
         });
       }
     },
@@ -342,6 +354,21 @@ export const useRoomStore = create<RoomState>((set, get) => {
       try {
         await webrtcService.startStreamingFile(file);
         
+        if (!file) {
+          const currentUrl = get().p2pObjectUrl;
+          if (currentUrl) {
+            URL.revokeObjectURL(currentUrl);
+          }
+          set({
+            p2pActiveFileId: null,
+            p2pProgress: 0,
+            p2pReceivedBytes: 0,
+            p2pObjectUrl: null,
+            isP2PBuffering: false
+          });
+          return;
+        }
+
         // Generate fileId
         const fileId = 'f-' + Math.random().toString(36).substring(2, 8);
         
@@ -367,6 +394,25 @@ export const useRoomStore = create<RoomState>((set, get) => {
         });
       } catch (err: any) {
         logger.error('Failed to start local file streaming:', err.message);
+        set({ error: err.message });
+      }
+    },
+
+    removeVideo: async () => {
+      try {
+        await get().startStreamingFile(null);
+        await realtimeService.updatePlayback({
+          sourceType: 'url',
+          sourceUrl: '',
+          fileName: '',
+          fileSize: 0,
+          isPlaying: false,
+          playing: false,
+          currentTime: 0,
+          videoId: ''
+        });
+      } catch (err: any) {
+        logger.error('Failed to remove video:', err.message);
         set({ error: err.message });
       }
     },
@@ -488,6 +534,11 @@ export const useRoomStore = create<RoomState>((set, get) => {
               realtimeService.clearListeners();
               webrtcService.close();
 
+              const oldSubUrl = get().p2pSubtitleUrl;
+              if (oldSubUrl) {
+                URL.revokeObjectURL(oldSubUrl);
+              }
+
               set({
                 room: null,
                 participants: [],
@@ -499,7 +550,9 @@ export const useRoomStore = create<RoomState>((set, get) => {
                 error: 'You have been removed from the room by the Host.',
                 webrtcPeers: [],
                 isLocalMuted: false,
-                floatingReactions: []
+                floatingReactions: [],
+                p2pSubtitleName: null,
+                p2pSubtitleUrl: null
               });
               return;
             }
@@ -542,6 +595,22 @@ export const useRoomStore = create<RoomState>((set, get) => {
 
         onPlaybackChange: (playbackState) => {
           set({ playbackState });
+
+          if (!playbackState.fileName) {
+            const currentUrl = get().p2pObjectUrl;
+            if (currentUrl) {
+              URL.revokeObjectURL(currentUrl);
+            }
+            set({
+              p2pActiveFileId: null,
+              p2pProgress: 0,
+              p2pReceivedBytes: 0,
+              p2pBufferedChunks: new Map(),
+              p2pObjectUrl: null,
+              isP2PBuffering: false
+            });
+            return;
+          }
 
           const isLocal = playbackState.sourceType === 'local';
           const selfId = get().participantId;
@@ -653,7 +722,27 @@ export const useRoomStore = create<RoomState>((set, get) => {
           logger.info(`Streaming audio ready for peer ${peerId}.`);
         },
         onDataChannelReceived: ({ peerId, label, message }) => {
-          logger.info(`Received data channel [${label}] from ${peerId}: "${message}"`);
+          logger.info(`Received data channel [${label}] from ${peerId}`);
+          if (label === 'SUBTITLE') {
+            try {
+              const sub = JSON.parse(message);
+              const oldUrl = get().p2pSubtitleUrl;
+              if (oldUrl) {
+                URL.revokeObjectURL(oldUrl);
+              }
+              const blob = new Blob([sub.content], { type: 'text/vtt' });
+              const url = URL.createObjectURL(blob);
+              set({ p2pSubtitleName: sub.name, p2pSubtitleUrl: url });
+            } catch (e: any) {
+              logger.error('Failed to parse incoming subtitle data:', e.message);
+            }
+          } else if (label === 'SUBTITLE_CLEAR') {
+            const oldUrl = get().p2pSubtitleUrl;
+            if (oldUrl) {
+              URL.revokeObjectURL(oldUrl);
+            }
+            set({ p2pSubtitleName: null, p2pSubtitleUrl: null });
+          }
         },
         onTransferProgress: ({ fileId: _fileId, progress, receivedBytes }) => {
           set({ p2pProgress: progress, p2pReceivedBytes: receivedBytes });

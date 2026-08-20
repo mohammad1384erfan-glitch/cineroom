@@ -745,8 +745,8 @@ export class MockRealtimeService implements RealtimeService {
     const playing = state.playing !== undefined ? state.playing : (state.isPlaying !== undefined ? state.isPlaying : current.playing);
     const videoId = state.videoId !== undefined ? state.videoId : (state.sourceUrl !== undefined ? state.sourceUrl : current.videoId);
 
-    const cleanFileName = state.fileName ? this.sanitizeInput(state.fileName).slice(0, 100) : (state.fileName === null ? '' : current.fileName);
-    const cleanSourceUrl = state.sourceUrl ? this.sanitizeInput(state.sourceUrl).slice(0, 1000) : (state.sourceUrl === null ? '' : current.sourceUrl);
+    const cleanFileName = state.fileName !== undefined ? (state.fileName ? this.sanitizeInput(state.fileName).slice(0, 100) : '') : current.fileName;
+    const cleanSourceUrl = state.sourceUrl !== undefined ? (state.sourceUrl ? this.sanitizeInput(state.sourceUrl).slice(0, 1000) : '') : current.sourceUrl;
 
     const updated: PlaybackState = {
       ...current,

@@ -15,6 +15,7 @@ export class MockWebRTCService implements WebRTCService {
   // Data Channel Properties
   private dataChannels: Map<string, RTCDataChannel> = new Map();
   private streamingFile: File | null = null;
+  private activeSubtitle: { name: string; content: string } | null = null;
   private activeReceiveFileId: string | null = null;
   private pendingChunkHeader: { fileId: string; index: number; totalChunks: number; size: number } | null = null;
   private receivedChunkBuffers: Map<number, ArrayBuffer> = new Map();
@@ -94,6 +95,13 @@ export class MockWebRTCService implements WebRTCService {
 
     dataChannel.onopen = () => {
       logger.webrtc(`DataChannel 'cineroom-p2p-media' opened with peer [${peerId}].`);
+      if (this.activeSubtitle) {
+        dataChannel.send(JSON.stringify({
+          type: 'CUSTOM_DATA',
+          label: 'SUBTITLE',
+          message: JSON.stringify(this.activeSubtitle)
+        }));
+      }
     };
 
     dataChannel.onclose = () => {
@@ -147,6 +155,14 @@ export class MockWebRTCService implements WebRTCService {
               };
               reader.readAsArrayBuffer(slice);
             }
+          } else if (msg.type === 'CUSTOM_DATA') {
+            if (this.listeners.onDataChannelReceived) {
+              this.listeners.onDataChannelReceived({
+                peerId: senderId,
+                label: msg.label,
+                message: msg.message
+              });
+            }
           }
         } catch (e: any) {
           logger.error('Failed to parse text command on P2P channel:', e.message);
@@ -186,9 +202,13 @@ export class MockWebRTCService implements WebRTCService {
     }
   }
 
-  public async startStreamingFile(file: File): Promise<void> {
+  public async startStreamingFile(file: File | null): Promise<void> {
     this.streamingFile = file;
-    logger.webrtc(`Loaded local file for P2P streaming: ${file.name} (${file.size} bytes)`);
+    if (file) {
+      logger.webrtc(`Loaded local file for P2P streaming: ${file.name} (${file.size} bytes)`);
+    } else {
+      logger.webrtc(`Cleared local file for P2P streaming.`);
+    }
     return Promise.resolve();
   }
 
@@ -430,8 +450,26 @@ export class MockWebRTCService implements WebRTCService {
     return this.isMuted;
   }
 
-  public sendData(_label: string, _message: string): void {
-    // Unused in audio phase
+  public sendData(label: string, message: string): void {
+    if (label === 'SUBTITLE') {
+      try {
+        this.activeSubtitle = JSON.parse(message);
+      } catch {
+        this.activeSubtitle = null;
+      }
+    } else if (label === 'SUBTITLE_CLEAR') {
+      this.activeSubtitle = null;
+    }
+
+    this.dataChannels.forEach((channel) => {
+      if (channel.readyState === 'open') {
+        channel.send(JSON.stringify({
+          type: 'CUSTOM_DATA',
+          label,
+          message
+        }));
+      }
+    });
   }
 
   // --- WEBAUDIO LOCAL SPEAKER ANALYSIS ---

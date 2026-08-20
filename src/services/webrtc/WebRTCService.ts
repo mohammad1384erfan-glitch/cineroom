@@ -44,7 +44,7 @@ export interface WebRTCService {
   /**
    * Registers a local media file to stream progressively to other participants.
    */
-  startStreamingFile(file: File): Promise<void>;
+  startStreamingFile(file: File | null): Promise<void>;
 
   /**
    * Dispatches a chunk request over WebRTC DataChannels for progressive buffering.

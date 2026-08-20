@@ -95,6 +95,13 @@ const STICKERS = [
   { id: 'thumbs_up', emoji: '👍', label: 'Like' },
 ];
 
+const convertSrtToVtt = (srtContent: string): string => {
+  let vtt = srtContent.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  vtt = 'WEBVTT\n\n' + vtt;
+  vtt = vtt.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
+  return vtt;
+};
+
 const validateVideoUrl = (url: string): Promise<void> => {
   return new Promise((resolve, reject) => {
     try {
@@ -164,6 +171,7 @@ export const Room: React.FC = () => {
   const [directUrl, setDirectUrl] = useState('');
   const [videoTitle, setVideoTitle] = useState('');
   const [chatInput, setChatInput] = useState('');
+  const [showChangeVideoForm, setShowChangeVideoForm] = useState(false);
   const [activeTab, setActiveTab] = useState<'chat' | 'members' | 'queue'>('chat');
   const [isCinemaMode, setIsCinemaMode] = useState(false);
   const [showPermissionsModal, setShowPermissionsModal] = useState(false);
@@ -477,8 +485,98 @@ export const Room: React.FC = () => {
       alert(`Warning: The format of "${file.name}" (${mimeType}) may not be natively supported by your browser. If playback fails, please use a standard MP4 file.`);
     }
 
+    // Clear subtitle if changing video
+    if (store.p2pSubtitleName) {
+      handleRemoveSubtitle();
+    }
+
     store.startStreamingFile(file);
     logger.info(`Media: Local progressive P2P stream started: ${file.name} (${(file.size / (1024 * 1024)).toFixed(1)} MB)`);
+  };
+
+  const handleSubtitleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const ext = file.name.split('.').pop()?.toLowerCase();
+    if (ext !== 'vtt' && ext !== 'srt') {
+      alert('Unsupported subtitle format. Only .vtt and .srt files are supported.');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      try {
+        let content = event.target?.result as string;
+        if (!content) {
+          throw new Error('File content is empty.');
+        }
+
+        if (ext === 'srt') {
+          content = convertSrtToVtt(content);
+        }
+
+        const oldUrl = store.p2pSubtitleUrl;
+        if (oldUrl) {
+          URL.revokeObjectURL(oldUrl);
+        }
+
+        const blob = new Blob([content], { type: 'text/vtt' });
+        const url = URL.createObjectURL(blob);
+
+        useRoomStore.setState({
+          p2pSubtitleName: file.name,
+          p2pSubtitleUrl: url
+        });
+
+        webrtcService.sendData('SUBTITLE', JSON.stringify({
+          name: file.name,
+          content
+        }));
+
+        logger.info(`Subtitles: Loaded subtitle track "${file.name}"`);
+      } catch (err: any) {
+        alert(`Failed to load subtitle file: ${err.message}`);
+      }
+    };
+    reader.onerror = () => {
+      alert('Failed to read subtitle file.');
+    };
+    reader.readAsText(file);
+  };
+
+  const handleRemoveSubtitle = () => {
+    const oldUrl = store.p2pSubtitleUrl;
+    if (oldUrl) {
+      URL.revokeObjectURL(oldUrl);
+    }
+
+    useRoomStore.setState({
+      p2pSubtitleName: null,
+      p2pSubtitleUrl: null
+    });
+
+    webrtcService.sendData('SUBTITLE_CLEAR', '');
+    logger.info('Subtitles: Removed subtitle track.');
+  };
+
+  const handleRemoveVideo = async () => {
+    if (!isHost) {
+      alert('Only the Host can remove the video.');
+      return;
+    }
+
+    try {
+      await store.removeVideo();
+      if (store.p2pSubtitleName) {
+        handleRemoveSubtitle();
+      }
+      setShowChangeVideoForm(false);
+      setIsMovieFinished(false);
+      logger.info('Media: Removed current video source.');
+    } catch (err: any) {
+      alert(`Failed to remove video: ${err.message}`);
+    }
   };
 
   const handleTogglePlay = () => {
@@ -950,7 +1048,7 @@ export const Room: React.FC = () => {
                   <>
                     <video 
                       ref={videoElementRef}
-                      key={store.playbackState.sourceType === 'local' ? store.p2pObjectUrl || '' : store.playbackState.sourceUrl}
+                      key={(store.playbackState.sourceType === 'local' ? store.p2pObjectUrl || '' : store.playbackState.sourceUrl) + (store.p2pSubtitleUrl || '')}
                       className="w-full h-full object-contain"
                       controls={false}
                       onPlay={handleLocalPlay}
@@ -964,6 +1062,15 @@ export const Room: React.FC = () => {
                         src={store.playbackState.sourceType === 'local' ? store.p2pObjectUrl || '' : store.playbackState.sourceUrl} 
                         type="video/mp4" 
                       />
+                      {store.p2pSubtitleUrl && (
+                        <track 
+                          kind="subtitles" 
+                          src={store.p2pSubtitleUrl} 
+                          srcLang="en" 
+                          label={store.p2pSubtitleName || 'Subtitles'} 
+                          default 
+                        />
+                      )}
                     </video>
 
                     {isMovieFinished && (
@@ -1286,45 +1393,90 @@ export const Room: React.FC = () => {
                 </div>
 
                 {/* Media loader forms */}
-                {isHost && (
-                  <div className="flex flex-wrap items-center gap-3">
-                    <form onSubmit={handleLoadUrlVideo} className="flex items-center gap-2">
-                      <input 
-                        type="url"
-                        placeholder={isUrlLoading ? "Verifying URL..." : "Load Direct HTTP URL (MP4)"}
-                        value={directUrl}
-                        onChange={(e) => setDirectUrl(e.target.value)}
-                        disabled={isUrlLoading}
-                        className="px-3 py-1.5 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none w-48 text-brand-text-main disabled:opacity-50"
-                      />
-                      <input 
-                        type="text"
-                        placeholder="Video Title (Optional)"
-                        value={videoTitle}
-                        onChange={(e) => setVideoTitle(e.target.value)}
-                        disabled={isUrlLoading}
-                        className="px-3 py-1.5 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none w-32 text-brand-text-main disabled:opacity-50"
-                      />
-                      <Button variant="secondary" size="sm" type="submit" isLoading={isUrlLoading}>
-                        Load
-                      </Button>
-                    </form>
+                {isHost && (() => {
+                  const isVideoLoaded = !!store.playbackState.fileName || !!store.playbackState.sourceUrl;
+                  
+                  if (!isVideoLoaded || showChangeVideoForm) {
+                    return (
+                      <div className="flex flex-wrap items-center gap-3">
+                        <form onSubmit={handleLoadUrlVideo} className="flex items-center gap-2">
+                          <input 
+                            type="url"
+                            placeholder={isUrlLoading ? "Verifying URL..." : "Load Direct HTTP URL (MP4)"}
+                            value={directUrl}
+                            onChange={(e) => setDirectUrl(e.target.value)}
+                            disabled={isUrlLoading}
+                            className="px-3 py-1.5 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none w-48 text-brand-text-main disabled:opacity-50"
+                          />
+                          <input 
+                            type="text"
+                            placeholder="Video Title (Optional)"
+                            value={videoTitle}
+                            onChange={(e) => setVideoTitle(e.target.value)}
+                            disabled={isUrlLoading}
+                            className="px-3 py-1.5 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none w-32 text-brand-text-main disabled:opacity-50"
+                          />
+                          <Button variant="secondary" size="sm" type="submit" isLoading={isUrlLoading}>
+                            Load
+                          </Button>
+                        </form>
 
-                    <label className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-glass bg-brand-bg-card hover:bg-brand-bg-input text-xs cursor-pointer text-brand-text-muted hover:text-white transition-colors duration-200">
-                      <FolderOpen size={13} />
-                      <span>Host Local File</span>
-                      <input 
-                        type="file" 
-                        accept="video/*" 
-                        onChange={handleLocalFileSelect}
-                        className="hidden" 
-                      />
-                    </label>
-                    <span className="text-[9px] text-zinc-500 max-w-[280px] leading-normal block italic select-none">
-                      ⚠️ Local videos stream directly from the Host's device. Quality matches the Host's upload bandwidth and network stability.
-                    </span>
-                  </div>
-                )}
+                        <label className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-glass bg-brand-bg-card hover:bg-brand-bg-input text-xs cursor-pointer text-brand-text-muted hover:text-white transition-colors duration-200">
+                          <FolderOpen size={13} />
+                          <span>Host Local File</span>
+                          <input 
+                            type="file" 
+                            accept="video/*" 
+                            onChange={handleLocalFileSelect}
+                            className="hidden" 
+                          />
+                        </label>
+                        {isVideoLoaded && (
+                          <Button variant="ghost" size="sm" onClick={() => setShowChangeVideoForm(false)}>
+                            Cancel
+                          </Button>
+                        )}
+                        <span className="text-[9px] text-zinc-500 max-w-[280px] leading-normal block italic select-none">
+                          ⚠️ Local videos stream directly from the Host's device. Quality matches the Host's upload bandwidth and network stability.
+                        </span>
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div className="flex flex-wrap items-center gap-3">
+                      <Button variant="outline" size="sm" onClick={() => setShowChangeVideoForm(true)}>
+                        Change Video
+                      </Button>
+
+                      <label className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-glass bg-brand-bg-card hover:bg-brand-bg-input text-xs cursor-pointer text-brand-text-muted hover:text-white transition-colors duration-200">
+                        <MessageSquare size={13} />
+                        <span>{store.p2pSubtitleName ? 'Change Subtitle' : 'Add Subtitle'}</span>
+                        <input 
+                          type="file" 
+                          accept=".vtt,.srt" 
+                          onChange={handleSubtitleFileSelect}
+                          className="hidden" 
+                        />
+                      </label>
+
+                      {store.p2pSubtitleName && (
+                        <div className="flex items-center gap-2 bg-black/30 border border-glass px-2.5 py-1 rounded-lg">
+                          <span className="text-[10px] text-zinc-300 max-w-[120px] truncate">
+                            📝 {store.p2pSubtitleName}
+                          </span>
+                          <Button variant="ghost" size="sm" onClick={handleRemoveSubtitle} className="p-0.5 h-auto text-red-400 hover:text-red-300 hover:bg-transparent">
+                            <Trash2 size={12} />
+                          </Button>
+                        </div>
+                      )}
+
+                      <Button variant="danger" size="sm" onClick={handleRemoveVideo}>
+                        Remove Video
+                      </Button>
+                    </div>
+                  );
+                })()}
               </div>
             </div>
           </Card>
