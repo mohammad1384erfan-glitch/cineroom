@@ -1,6 +1,8 @@
--- Supabase SQL Migration: Fix host_id and participant_id UUID type matching and pgcrypto qualification
--- Resolves the error: "Column 'id' is of type uuid but expression is of type text"
--- Enforces UUID typing on new_part_id and uses the caller's auth.uid() directly
+-- Supabase SQL Migration: Fix host_id and participant_id UUID type matching, pgcrypto qualification, and current_time column quoting in RPCs
+-- Resolves the errors:
+--   - "Column 'id' is of type uuid but expression is of type text"
+--   - "Column 'host_id' is of type uuid but expression is of type text"
+--   - "Failed to change video via RPC:" / "Failed to update playback state:"
 
 -- 1. Ensure pgcrypto is enabled in the extensions schema
 CREATE EXTENSION IF NOT EXISTS pgcrypto SCHEMA extensions;
@@ -43,9 +45,9 @@ BEGIN
   
   -- Bind IDs to the caller's authenticated user UUID (required for foreign key constraints)
   caller_uid := auth.uid();
-  IF caller_uid IS NULL THEN
+  if caller_uid IS NULL then
     RAISE EXCEPTION 'Unauthorized: Cryptographic Auth session missing.';
-  END IF;
+  end if;
 
   new_part_id := caller_uid;
 
@@ -118,9 +120,9 @@ BEGIN
 
   -- Bind IDs to the caller's authenticated user UUID (required for foreign key constraints)
   caller_uid := auth.uid();
-  IF caller_uid IS NULL THEN
+  if caller_uid IS NULL then
     RAISE EXCEPTION 'Unauthorized: Cryptographic Auth session missing.';
-  END IF;
+  end if;
 
   new_part_id := caller_uid;
 
@@ -136,5 +138,135 @@ BEGIN
     'participantId', new_part_id,
     'roomName', (SELECT name FROM rooms WHERE id = target_room_id)
   );
+END;
+$$;
+
+-- 4. Update playback_change_video to use quoted "current_time" column reference
+CREATE OR REPLACE FUNCTION playback_change_video(
+  p_room_id UUID,
+  p_source_type TEXT,
+  p_source_url TEXT,
+  p_file_name TEXT,
+  p_file_size BIGINT,
+  p_video_id TEXT
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  caller_is_host BOOLEAN;
+  has_permission BOOLEAN;
+BEGIN
+  SELECT (host_id = auth.uid()) INTO caller_is_host
+  FROM rooms
+  WHERE id = p_room_id;
+
+  IF caller_is_host IS NOT TRUE THEN
+    SELECT can_change_video INTO has_permission
+    FROM participants
+    WHERE room_id = p_room_id AND id = auth.uid();
+
+    IF has_permission IS NOT TRUE THEN
+      RAISE EXCEPTION 'Unauthorized: You do not have permission to change the video source.';
+    END IF;
+  END IF;
+
+  UPDATE playback_states
+  SET
+    source_type = p_source_type,
+    source_url = p_source_url,
+    file_name = p_file_name,
+    file_size = p_file_size,
+    video_id = p_video_id,
+    is_playing = FALSE,
+    playing = FALSE,
+    "current_time" = 0, -- Quoted current_time column
+    state_version = state_version + 1,
+    event_id = concat('chg-', encode(extensions.gen_random_bytes(4), 'hex')),
+    last_update_timestamp = EXTRACT(epoch FROM now())::BIGINT * 1000,
+    updated_at = timezone('utc'::text, now())
+  WHERE room_id = p_room_id;
+END;
+$$;
+
+-- 5. Update playback_play_pause to use quoted "current_time" column reference
+CREATE OR REPLACE FUNCTION playback_play_pause(
+  p_room_id UUID,
+  p_is_playing BOOLEAN,
+  p_event_id TEXT,
+  p_current_time DOUBLE PRECISION
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  caller_is_host BOOLEAN;
+  has_permission BOOLEAN;
+BEGIN
+  SELECT (host_id = auth.uid()) INTO caller_is_host
+  FROM rooms
+  WHERE id = p_room_id;
+
+  IF caller_is_host IS NOT TRUE THEN
+    SELECT can_play_pause INTO has_permission
+    FROM participants
+    WHERE room_id = p_room_id AND id = auth.uid();
+
+    IF has_permission IS NOT TRUE THEN
+      RAISE EXCEPTION 'Unauthorized: You do not have play/pause permission.';
+    END IF;
+  END IF;
+
+  UPDATE playback_states
+  SET
+    is_playing = p_is_playing,
+    playing = p_is_playing,
+    "current_time" = p_current_time, -- Quoted current_time column
+    event_id = p_event_id,
+    state_version = state_version + 1,
+    last_update_timestamp = EXTRACT(epoch FROM now())::BIGINT * 1000,
+    updated_at = timezone('utc'::text, now())
+  WHERE room_id = p_room_id;
+END;
+$$;
+
+-- 6. Update playback_seek to use quoted "current_time" column reference
+CREATE OR REPLACE FUNCTION playback_seek(
+  p_room_id UUID,
+  p_current_time DOUBLE PRECISION,
+  p_event_id TEXT
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  caller_is_host BOOLEAN;
+  has_permission BOOLEAN;
+BEGIN
+  SELECT (host_id = auth.uid()) INTO caller_is_host
+  FROM rooms
+  WHERE id = p_room_id;
+
+  IF caller_is_host IS NOT TRUE THEN
+    SELECT can_seek INTO has_permission
+    FROM participants
+    WHERE room_id = p_room_id AND id = auth.uid();
+
+    IF has_permission IS NOT TRUE THEN
+      RAISE EXCEPTION 'Unauthorized: You do not have seek permission.';
+    END IF;
+  END IF;
+
+  UPDATE playback_states
+  SET
+    "current_time" = p_current_time, -- Quoted current_time column
+    event_id = p_event_id,
+    state_version = state_version + 1,
+    last_update_timestamp = EXTRACT(epoch FROM now())::BIGINT * 1000,
+    updated_at = timezone('utc'::text, now())
+  WHERE room_id = p_room_id;
 END;
 $$;
