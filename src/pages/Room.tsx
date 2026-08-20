@@ -4,7 +4,7 @@ import {
   Film, Copy, Check, LogOut, Play, Pause, 
   Terminal, Users, FolderOpen, Send, 
   Crown, Wifi, Mic, MicOff, Plus, Trash2, ArrowUp, ArrowDown, Minimize2, Maximize2,
-  Lock, Unlock, MessageSquare, PlaySquare, Shield, RefreshCw
+  Lock, Unlock, MessageSquare, PlaySquare, Shield, RefreshCw, Smile
 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
@@ -82,6 +82,61 @@ function getThemeClasses(theme: string) {
       };
   }
 }
+const STICKERS = [
+  { id: 'popcorn', emoji: '🍿', label: 'Popcorn' },
+  { id: 'soda', emoji: '🥤', label: 'Soda' },
+  { id: 'clapper', emoji: '🎬', label: 'Clapper' },
+  { id: 'ticket', emoji: '🎟️', label: 'Ticket' },
+  { id: 'party', emoji: '🎉', label: 'Celebration' },
+  { id: 'heart_eyes', emoji: '😍', label: 'Love' },
+  { id: 'laughing', emoji: '😂', label: 'LOL' },
+  { id: 'screaming', emoji: '😱', label: 'Shocked' },
+  { id: 'fire', emoji: '🔥', label: 'Hyped' },
+  { id: 'thumbs_up', emoji: '👍', label: 'Like' },
+];
+
+const validateVideoUrl = (url: string): Promise<void> => {
+  return new Promise((resolve, reject) => {
+    try {
+      new URL(url);
+    } catch (_) {
+      return reject(new Error('Invalid URL format. Please enter a valid web URL.'));
+    }
+
+    const tempVideo = document.createElement('video');
+    tempVideo.preload = 'metadata';
+    tempVideo.src = url;
+    
+    const timer = setTimeout(() => {
+      tempVideo.src = '';
+      tempVideo.load();
+      reject(new Error('Connection timed out. The video server did not respond.'));
+    }, 6000);
+
+    tempVideo.onloadedmetadata = () => {
+      clearTimeout(timer);
+      tempVideo.src = '';
+      tempVideo.load();
+      resolve();
+    };
+
+    tempVideo.onerror = () => {
+      clearTimeout(timer);
+      tempVideo.src = '';
+      tempVideo.load();
+      const err = tempVideo.error;
+      if (err) {
+        if (err.code === 1) reject(new Error('Video loading aborted.'));
+        else if (err.code === 2) reject(new Error('Network error: Unable to download video.'));
+        else if (err.code === 3) reject(new Error('Decode error: The video codec or container is not supported by your browser.'));
+        else if (err.code === 4) reject(new Error('Format error: The video is not playable. This is usually due to CORS restrictions or an invalid MIME type.'));
+        else reject(new Error('Failed to load video source. Please verify the URL and CORS permissions.'));
+      } else {
+        reject(new Error('Failed to load video. This URL may require authentication or have CORS block.'));
+      }
+    };
+  });
+};
 
 export const Room: React.FC = () => {
   const navigate = useNavigate();
@@ -129,6 +184,45 @@ export const Room: React.FC = () => {
   const [isMobileChatOpen, setIsMobileChatOpen] = useState(false);
   const [isMobileMembersOpen, setIsMobileMembersOpen] = useState(false);
   const [isMobileQueueOpen, setIsMobileQueueOpen] = useState(false);
+
+  // Sticker Picker and URL Loading States
+  const [isStickerPickerOpen, setIsStickerPickerOpen] = useState(false);
+  const [isMobileStickerPickerOpen, setIsMobileStickerPickerOpen] = useState(false);
+  const [isUrlLoading, setIsUrlLoading] = useState(false);
+
+  const stickerPickerRef = useRef<HTMLDivElement>(null);
+  const mobileStickerPickerRef = useRef<HTMLDivElement>(null);
+
+  // Sticker picker click-outside handlers
+  useEffect(() => {
+    const handleOutsideClick = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if (isStickerPickerOpen && stickerPickerRef.current && !stickerPickerRef.current.contains(target)) {
+        setIsStickerPickerOpen(false);
+      }
+      if (isMobileStickerPickerOpen && mobileStickerPickerRef.current && !mobileStickerPickerRef.current.contains(target)) {
+        setIsMobileStickerPickerOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutsideClick);
+    return () => document.removeEventListener('mousedown', handleOutsideClick);
+  }, [isStickerPickerOpen, isMobileStickerPickerOpen]);
+
+  const handleSendSticker = (emoji: string) => {
+    store.sendChatMessage(`[STICKER]:${emoji}`).then(() => {
+      setIsStickerPickerOpen(false);
+    }).catch(err => {
+      alert(err.message);
+    });
+  };
+
+  const handleSendMobileSticker = (emoji: string) => {
+    store.sendChatMessage(`[STICKER]:${emoji}`).then(() => {
+      setIsMobileStickerPickerOpen(false);
+    }).catch(err => {
+      alert(err.message);
+    });
+  };
 
   // References
   const logsEndRef = useRef<HTMLDivElement>(null);
@@ -347,20 +441,26 @@ export const Room: React.FC = () => {
     if (!directUrl.trim()) return;
 
     const title = videoTitle.trim() || directUrl.split('/').pop() || 'Direct Video Stream';
+    setIsUrlLoading(true);
 
     try {
+      await validateVideoUrl(directUrl.trim());
       await store.updatePlayback({
         sourceType: 'url',
         sourceUrl: directUrl.trim(),
         fileName: title,
         fileSize: 0,
         isPlaying: false,
-        currentTime: 0
+        playing: false,
+        currentTime: 0,
+        videoId: directUrl.trim()
       });
       setDirectUrl('');
       setVideoTitle('');
     } catch (err: any) {
       alert(err.message);
+    } finally {
+      setIsUrlLoading(false);
     }
   };
 
@@ -369,8 +469,12 @@ export const Room: React.FC = () => {
     if (!file) return;
 
     const ext = file.name.split('.').pop()?.toLowerCase();
-    if (ext && ['mkv', 'avi', 'mov'].includes(ext)) {
-      alert(`Warning: .${ext.toUpperCase()} files may contain codecs that are unsupported by some browsers. For optimal compatibility, use browser-native MP4 (H.264/AAC).`);
+    const mimeType = file.type;
+
+    if (ext === 'mkv' || mimeType.includes('matroska')) {
+      alert(`Warning: .MKV is a container format that is generally not natively supported by web browsers. Only MKV files containing browser-supported codecs (like H.264 video and AAC/MP3 audio) can be played, but many will fail to render video or audio. For optimal compatibility, please use web-native MP4 (H.264/AAC).`);
+    } else if (mimeType && !document.createElement('video').canPlayType(mimeType)) {
+      alert(`Warning: The format of "${file.name}" (${mimeType}) may not be natively supported by your browser. If playback fails, please use a standard MP4 file.`);
     }
 
     store.startStreamingFile(file);
@@ -610,17 +714,25 @@ export const Room: React.FC = () => {
   };
 
   // Preset sample movies to quickly test the player
-  const loadSampleVideo = (url: string, title: string) => {
-    store.updatePlayback({
-      sourceType: 'url',
-      sourceUrl: url,
-      fileName: title,
-      fileSize: 0,
-      isPlaying: false,
-      playing: false,
-      currentTime: 0,
-      videoId: url
-    });
+  const loadSampleVideo = async (url: string, title: string) => {
+    setIsUrlLoading(true);
+    try {
+      await validateVideoUrl(url);
+      await store.updatePlayback({
+        sourceType: 'url',
+        sourceUrl: url,
+        fileName: title,
+        fileSize: 0,
+        isPlaying: false,
+        playing: false,
+        currentTime: 0,
+        videoId: url
+      });
+    } catch (err: any) {
+      alert(err.message);
+    } finally {
+      setIsUrlLoading(false);
+    }
   };
 
   return (
@@ -1179,19 +1291,21 @@ export const Room: React.FC = () => {
                     <form onSubmit={handleLoadUrlVideo} className="flex items-center gap-2">
                       <input 
                         type="url"
-                        placeholder="Load Direct HTTP URL (MP4)"
+                        placeholder={isUrlLoading ? "Verifying URL..." : "Load Direct HTTP URL (MP4)"}
                         value={directUrl}
                         onChange={(e) => setDirectUrl(e.target.value)}
-                        className="px-3 py-1.5 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none w-48 text-brand-text-main"
+                        disabled={isUrlLoading}
+                        className="px-3 py-1.5 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none w-48 text-brand-text-main disabled:opacity-50"
                       />
                       <input 
                         type="text"
                         placeholder="Video Title (Optional)"
                         value={videoTitle}
                         onChange={(e) => setVideoTitle(e.target.value)}
-                        className="px-3 py-1.5 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none w-32 text-brand-text-main"
+                        disabled={isUrlLoading}
+                        className="px-3 py-1.5 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none w-32 text-brand-text-main disabled:opacity-50"
                       />
-                      <Button variant="secondary" size="sm" type="submit">
+                      <Button variant="secondary" size="sm" type="submit" isLoading={isUrlLoading}>
                         Load
                       </Button>
                     </form>
@@ -1281,7 +1395,7 @@ export const Room: React.FC = () => {
               {/* Chat Input panel */}
               {activeTab === 'chat' && (
                 <div className="p-3 border-t border-glass bg-black/15">
-                  <form onSubmit={handleSendChat} className="flex gap-2">
+                  <form onSubmit={handleSendChat} className="flex gap-2 relative">
                     <input 
                       type="text" 
                       placeholder={selfParticipant?.permissions.canChat || isHost ? "Type a message..." : "Muted by Host"}
@@ -1290,6 +1404,16 @@ export const Room: React.FC = () => {
                       disabled={!isHost && !selfParticipant?.permissions.canChat}
                       className="flex-1 px-3 py-2 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none text-white disabled:opacity-50"
                     />
+                    {(isHost || selfParticipant?.permissions.canChat) && (
+                      <button
+                        type="button"
+                        onClick={() => setIsStickerPickerOpen(!isStickerPickerOpen)}
+                        className="px-1 text-zinc-400 hover:text-white transition-colors duration-200"
+                        title="Choose Sticker"
+                      >
+                        <Smile size={16} />
+                      </button>
+                    )}
                     <Button 
                       variant="primary" 
                       size="sm" 
@@ -1299,6 +1423,30 @@ export const Room: React.FC = () => {
                     >
                       <Send size={12} />
                     </Button>
+
+                    {isStickerPickerOpen && (
+                      <div 
+                        ref={stickerPickerRef}
+                        className="absolute bottom-12 right-0 z-30 bg-zinc-950 border border-glass p-3 rounded-xl shadow-xl w-64 animate-fade-in"
+                      >
+                        <div className="text-[10px] uppercase font-bold text-zinc-500 tracking-wider mb-2 select-none text-left">
+                          Send Sticker
+                        </div>
+                        <div className="grid grid-cols-5 gap-2">
+                          {STICKERS.map((sticker) => (
+                            <button
+                              key={sticker.id}
+                              type="button"
+                              title={sticker.label}
+                              onClick={() => handleSendSticker(sticker.emoji)}
+                              className="text-3xl hover:scale-125 hover:bg-white/5 p-1 rounded transition-all duration-150 select-none cursor-pointer"
+                            >
+                              {sticker.emoji}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </form>
                 </div>
               )}
@@ -1378,19 +1526,55 @@ export const Room: React.FC = () => {
           <div className="flex-1 overflow-y-auto flex flex-col gap-3 min-h-0 pb-4">
             {renderChatComponent()}
           </div>
-          <form onSubmit={handleSendChat} className="flex gap-2 p-2 border-t border-glass bg-black/10">
-            <input 
-              type="text" 
-              placeholder={selfParticipant?.permissions.canChat || isHost ? "Type a message..." : "Muted by Host"}
-              value={chatInput}
-              onChange={(e) => setChatInput(e.target.value)}
-              disabled={!isHost && !selfParticipant?.permissions.canChat}
-              className="flex-1 px-3 py-2 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none text-white"
-            />
-            <Button variant="primary" size="sm" type="submit">
-              Send
-            </Button>
-          </form>
+          <div className="p-2 border-t border-glass bg-black/10 flex flex-col gap-2 relative">
+            {isMobileStickerPickerOpen && (
+              <div 
+                ref={mobileStickerPickerRef}
+                className="bg-zinc-950 border border-glass p-3 rounded-xl shadow-xl w-full mb-1 animate-fade-in"
+              >
+                <div className="text-[10px] uppercase font-bold text-zinc-500 tracking-wider mb-2 select-none text-left">
+                  Send Sticker
+                </div>
+                <div className="grid grid-cols-5 gap-2">
+                  {STICKERS.map((sticker) => (
+                    <button
+                      key={sticker.id}
+                      type="button"
+                      title={sticker.label}
+                      onClick={() => handleSendMobileSticker(sticker.emoji)}
+                      className="text-3xl hover:scale-125 p-1 rounded transition-all duration-150 select-none cursor-pointer"
+                    >
+                      {sticker.emoji}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <form onSubmit={handleSendChat} className="flex gap-2 w-full">
+              <input 
+                type="text" 
+                placeholder={selfParticipant?.permissions.canChat || isHost ? "Type a message..." : "Muted by Host"}
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                disabled={!isHost && !selfParticipant?.permissions.canChat}
+                className="flex-1 px-3 py-2 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none text-white"
+              />
+              {(isHost || selfParticipant?.permissions.canChat) && (
+                <button
+                  type="button"
+                  onClick={() => setIsMobileStickerPickerOpen(!isMobileStickerPickerOpen)}
+                  className="px-1 text-zinc-400 hover:text-white transition-colors duration-200"
+                  title="Choose Sticker"
+                >
+                  <Smile size={16} />
+                </button>
+              )}
+              <Button variant="primary" size="sm" type="submit">
+                Send
+              </Button>
+            </form>
+          </div>
         </div>
       </BottomSheet>
 
@@ -2099,15 +2283,21 @@ const ChatItem = React.memo(({
           )}
           {msg.senderName}
         </span>
-        <div className={`
-          px-3 py-2 rounded-xl text-xs leading-relaxed break-all select-text
-          ${isSelf 
-            ? 'bg-brand-primary/15 border border-brand-primary/20 text-white rounded-tr-none shadow-sm' 
-            : 'bg-zinc-900 border border-glass text-brand-text-main rounded-tl-none'
-          }
-        `}>
-          {msg.content}
-        </div>
+        {msg.content.startsWith('[STICKER]:') ? (
+          <div className="text-5xl py-1 px-1 select-none transform hover:scale-110 transition-transform duration-150">
+            {msg.content.substring(10)}
+          </div>
+        ) : (
+          <div className={`
+            px-3 py-2 rounded-xl text-xs leading-relaxed break-all select-text
+            ${isSelf 
+              ? 'bg-brand-primary/15 border border-brand-primary/20 text-white rounded-tr-none shadow-sm' 
+              : 'bg-zinc-900 border border-glass text-brand-text-main rounded-tl-none'
+            }
+          `}>
+            {msg.content}
+          </div>
+        )}
       </div>
     </div>
   );
