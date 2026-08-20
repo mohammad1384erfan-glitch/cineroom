@@ -1,6 +1,6 @@
--- Supabase SQL Migration: Fix host_id UUID type mapping and pgcrypto qualification
--- Resolves the error: "Column 'host_id' is of type uuid but expression is of type text"
--- Uses explicit concat() and maps host/participant IDs to the auth user's UUID (auth.uid())
+-- Supabase SQL Migration: Fix host_id and participant_id UUID type matching and pgcrypto qualification
+-- Resolves the error: "Column 'id' is of type uuid but expression is of type text"
+-- Enforces UUID typing on new_part_id and uses the caller's auth.uid() directly
 
 -- 1. Ensure pgcrypto is enabled in the extensions schema
 CREATE EXTENSION IF NOT EXISTS pgcrypto SCHEMA extensions;
@@ -22,7 +22,7 @@ DECLARE
   new_room_id UUID;
   new_code TEXT;
   caller_uid UUID;
-  new_part_id TEXT;
+  new_part_id UUID; -- Changed from TEXT to UUID to match participants.id primary key
   pwd_hash TEXT := NULL;
   chars TEXT := 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   i INT;
@@ -39,11 +39,15 @@ BEGIN
     END IF;
   END LOOP;
 
-  new_room_id := gen_random_uuid();
+  new_room_id := extensions.gen_random_uuid();
   
-  -- Bind IDs to the caller's authenticated user UUID (fallback to new UUID if unauthenticated)
-  caller_uid := coalesce(auth.uid(), gen_random_uuid());
-  new_part_id := caller_uid::text;
+  -- Bind IDs to the caller's authenticated user UUID (required for foreign key constraints)
+  caller_uid := auth.uid();
+  IF caller_uid IS NULL THEN
+    RAISE EXCEPTION 'Unauthorized: Cryptographic Auth session missing.';
+  END IF;
+
+  new_part_id := caller_uid;
 
   -- Use extensions schema qualification for pgcrypto functions
   IF room_password IS NOT NULL AND room_password <> '' THEN
@@ -86,7 +90,7 @@ DECLARE
   target_capacity INT;
   curr_count INT;
   caller_uid UUID;
-  new_part_id TEXT;
+  new_part_id UUID; -- Changed from TEXT to UUID to match participants.id primary key
 BEGIN
   SELECT id, has_password, password_hash, is_locked, capacity INTO target_room_id, target_has_password, target_pwd_hash, target_is_locked, target_capacity
   FROM rooms
@@ -112,15 +116,20 @@ BEGIN
     RAISE EXCEPTION 'Unable to join room. Room is at maximum capacity.';
   END IF;
 
-  -- Bind IDs to the caller's authenticated user UUID (fallback to new UUID if unauthenticated)
-  caller_uid := coalesce(auth.uid(), gen_random_uuid());
-  new_part_id := caller_uid::text;
+  -- Bind IDs to the caller's authenticated user UUID (required for foreign key constraints)
+  caller_uid := auth.uid();
+  IF caller_uid IS NULL THEN
+    RAISE EXCEPTION 'Unauthorized: Cryptographic Auth session missing.';
+  END IF;
+
+  new_part_id := caller_uid;
 
   INSERT INTO participants (id, room_id, name, avatar, is_host, joined_at, ping, is_muted, is_connected, connection_status, is_speaking)
   VALUES (new_part_id, target_room_id, user_nickname, user_avatar, FALSE, extract(epoch from now())::bigint * 1000, 0, FALSE, TRUE, 'connected', FALSE);
 
+  -- sender_id changed from 'system' (text) to caller_uid (UUID) to match chat_messages.sender_id constraint
   INSERT INTO chat_messages (id, room_id, sender_id, sender_name, sender_avatar, content, timestamp, is_system)
-  VALUES (concat('sys-', encode(gen_random_bytes(4), 'hex')), target_room_id, 'system', 'System', '', concat(user_nickname, ' joined the watch party'), extract(epoch from now())::bigint * 1000, TRUE);
+  VALUES (concat('sys-', encode(extensions.gen_random_bytes(4), 'hex')), target_room_id, caller_uid, 'System', '', concat(user_nickname, ' joined the watch party'), extract(epoch from now())::bigint * 1000, TRUE);
 
   RETURN jsonb_build_object(
     'roomId', target_room_id,
