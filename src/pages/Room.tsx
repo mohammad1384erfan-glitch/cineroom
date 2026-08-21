@@ -4,7 +4,7 @@ import {
   Film, Copy, Check, LogOut, Play, Pause, 
   Terminal, Users, FolderOpen, Send, 
   Crown, Wifi, Mic, MicOff, Plus, Trash2, ArrowUp, ArrowDown, Minimize2, Maximize2,
-  Lock, Unlock, MessageSquare, PlaySquare, Shield, RefreshCw, Smile, AlertTriangle, X
+  Lock, Unlock, MessageSquare, PlaySquare, Shield, RefreshCw, Smile, AlertTriangle, X, Bell
 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
@@ -166,53 +166,99 @@ export const Room: React.FC = () => {
   const isChatActive = (!isCinemaMode && activeTab === 'chat') || isMobileChatOpen;
   const lastMessagesLengthRef = useRef(store.chatMessages.length);
 
-  useEffect(() => {
-    if (isChatActive) {
-      setUnreadChatCount(0);
-    } else {
-      const prevLength = lastMessagesLengthRef.current;
-      const newMessages = store.chatMessages.slice(prevLength);
-      
-      // Filter out messages sent by the local participant and system alerts
-      const incomingUnread = newMessages.filter(
-        (msg) => msg.senderId !== store.participantId && !msg.isSystem
-      );
+  // Chat Notification Sound & Toast
+  const [chatToastMessage, setChatToastMessage] = useState<ChatMessage | null>(null);
+  const chatToastTimeoutRef = useRef<any>(null);
 
-      if (incomingUnread.length > 0) {
-        setUnreadChatCount((prev) => {
-          const newCount = prev + incomingUnread.length;
-          console.log("[UNREAD_TRACE]", {
-            isChatActive: false,
-            senderId: incomingUnread[incomingUnread.length - 1].senderId,
-            localParticipantId: store.participantId,
-            previousCount: prev,
-            newCount: newCount,
-            badgeVisible: newCount > 0
+  // Synthesize modern harmonic chime with Web Audio API (zero external assets, instant)
+  const playChatNotificationSound = () => {
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const now = ctx.currentTime;
+
+      // Primary oscillator: D5 -> A5 glide
+      const osc1 = ctx.createOscillator();
+      const gain1 = ctx.createGain();
+      osc1.type = 'sine';
+      osc1.frequency.setValueAtTime(587.33, now);
+      osc1.frequency.exponentialRampToValueAtTime(880, now + 0.08);
+      gain1.gain.setValueAtTime(0.18, now);
+      gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.3);
+      osc1.connect(gain1);
+      gain1.connect(ctx.destination);
+
+      // Secondary subtle harmonic overtone: E6
+      const osc2 = ctx.createOscillator();
+      const gain2 = ctx.createGain();
+      osc2.type = 'sine';
+      osc2.frequency.setValueAtTime(1318.51, now + 0.04);
+      gain2.gain.setValueAtTime(0.08, now + 0.04);
+      gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.28);
+      osc2.connect(gain2);
+      gain2.connect(ctx.destination);
+
+      osc1.start(now);
+      osc1.stop(now + 0.3);
+      osc2.start(now + 0.04);
+      osc2.stop(now + 0.3);
+    } catch (_) {}
+  };
+
+  // Request browser desktop notification permission on room entry
+  useEffect(() => {
+    if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission().catch(() => {});
+    }
+  }, []);
+
+  useEffect(() => {
+    const prevLength = lastMessagesLengthRef.current;
+    const newMessages = store.chatMessages.slice(prevLength);
+    
+    // Filter out messages sent by the local participant and system alerts
+    const incomingUnread = newMessages.filter(
+      (msg) => msg.senderId !== store.participantId && !msg.isSystem
+    );
+
+    if (incomingUnread.length > 0) {
+      const latestMsg = incomingUnread[incomingUnread.length - 1];
+
+      // 1. Play chime audio notification for room participants
+      playChatNotificationSound();
+
+      // 2. Show floating notification toast banner if chat is not open or in cinema mode
+      if (!isChatActive || isCinemaMode) {
+        if (chatToastTimeoutRef.current) clearTimeout(chatToastTimeoutRef.current);
+        setChatToastMessage(latestMsg);
+        chatToastTimeoutRef.current = setTimeout(() => {
+          setChatToastMessage(null);
+        }, 4500);
+      }
+
+      // 3. Browser background notification if tab is hidden
+      if (typeof document !== 'undefined' && document.hidden && 'Notification' in window && Notification.permission === 'granted') {
+        try {
+          new Notification(latestMsg.senderName, {
+            body: latestMsg.content.startsWith('[STICKER]:') ? 'Sent a sticker 🎨' : latestMsg.content,
+            icon: '/favicon.ico'
           });
-          return newCount;
-        });
+        } catch (_) {}
+      }
+
+      if (!isChatActive) {
+        setUnreadChatCount((prev) => prev + incomingUnread.length);
       }
     }
     lastMessagesLengthRef.current = store.chatMessages.length;
-  }, [store.chatMessages, isChatActive, store.participantId]);
+  }, [store.chatMessages, isChatActive, isCinemaMode, store.participantId]);
 
   useEffect(() => {
     if (isChatActive) {
-      setUnreadChatCount((prev) => {
-        if (prev > 0) {
-          console.log("[UNREAD_TRACE]", {
-            isChatActive: true,
-            senderId: 'N/A',
-            localParticipantId: store.participantId,
-            previousCount: prev,
-            newCount: 0,
-            badgeVisible: false
-          });
-        }
-        return 0;
-      });
+      setUnreadChatCount(0);
     }
-  }, [isChatActive, store.participantId]);
+  }, [isChatActive]);
 
   // Sticker Picker and URL Loading States
   const [isStickerPickerOpen, setIsStickerPickerOpen] = useState(false);
@@ -988,6 +1034,47 @@ export const Room: React.FC = () => {
             )}
           </div>
         </header>
+      )}
+
+      {/* FLOATING CHAT NOTIFICATION TOAST */}
+      {chatToastMessage && (
+        <div 
+          onClick={() => {
+            setChatToastMessage(null);
+            if (isCinemaMode) setIsCinemaMode(false);
+            if (window.innerWidth < 1024) {
+              setIsMobileChatOpen(true);
+            } else {
+              setActiveTab('chat');
+            }
+          }}
+          className="fixed top-16 right-4 md:right-8 z-50 max-w-sm w-auto bg-zinc-900/95 backdrop-blur-md border border-brand-primary/50 rounded-2xl p-3.5 shadow-2xl flex items-center gap-3 cursor-pointer hover:border-brand-primary transition-all duration-300 animate-slide-in hover:scale-105 select-none"
+        >
+          <div className="w-10 h-10 rounded-full bg-brand-primary/20 border border-brand-primary/50 flex items-center justify-center text-lg flex-shrink-0">
+            {chatToastMessage.senderAvatar || '💬'}
+          </div>
+          <div className="flex flex-col min-w-0 pr-2">
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-bold text-white truncate">{chatToastMessage.senderName}</span>
+              <span className="text-[9px] text-brand-primary font-mono font-semibold uppercase flex items-center gap-1">
+                <Bell size={10} className="animate-bounce" /> New message
+              </span>
+            </div>
+            <p className="text-[11px] text-zinc-300 truncate max-w-[200px] mt-0.5">
+              {chatToastMessage.content.startsWith('[STICKER]:') ? 'Sent a sticker 🎨' : chatToastMessage.content}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setChatToastMessage(null);
+            }}
+            className="text-zinc-500 hover:text-white p-1 ml-auto transition-colors"
+          >
+            <X size={14} />
+          </button>
+        </div>
       )}
 
       {/* CORE WORKSPACE GRID */}
