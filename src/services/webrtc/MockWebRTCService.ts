@@ -2,6 +2,9 @@ import { PeerConnectionInfo, WebRTCEventListeners } from './types';
 import { WebRTCService } from './WebRTCService';
 import { realtimeService } from '../index';
 import { logger } from '../diagnostics/logger';
+import { useRoomStore } from '../../store/useRoomStore';
+
+let activeInstance: MockWebRTCService | null = null;
 
 export class MockWebRTCService implements WebRTCService {
   private pcs: Map<string, RTCPeerConnection> = new Map();
@@ -19,6 +22,7 @@ export class MockWebRTCService implements WebRTCService {
   private activeReceiveFileId: string | null = null;
   private pendingChunkHeader: { fileId: string; index: number; totalChunks: number; size: number } | null = null;
   private receivedChunkBuffers: Map<number, ArrayBuffer> = new Map();
+  private queuedCandidates: Map<string, RTCIceCandidateInit[]> = new Map();
 
   // Speaking Analysis properties
   private audioContext: AudioContext | null = null;
@@ -27,6 +31,7 @@ export class MockWebRTCService implements WebRTCService {
   private wasSpeaking = false;
 
   constructor() {
+    activeInstance = this;
     logger.info('Real WebRTC mesh service with P2P channels initialized.');
   }
 
@@ -67,7 +72,30 @@ export class MockWebRTCService implements WebRTCService {
       // Capture local audio track
       logger.webrtc('Requesting microphone access stream...');
       this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      console.log("[VOICE_DEBUG][MIC_GRANTED]", {
+        streamId: this.localStream.id
+      });
+      console.log("[VOICE_TRACE] MIC_GRANTED", {
+        streamId: this.localStream.id,
+        tracksCount: this.localStream.getTracks().length
+      });
+      this.localStream.getTracks().forEach((track) => {
+        console.log("[VOICE_TRACE] LOCAL_TRACK", {
+          id: track.id,
+          kind: track.kind,
+          enabled: track.enabled,
+          readyState: track.readyState
+        });
+      });
       logger.webrtc('Microphone track successfully captured.');
+
+      if (this.localStream) {
+        const audioTracks = this.localStream.getAudioTracks();
+        logger.webrtc(`[VOICE_DIAGNOSTICS] Stream acquired: ${this.localStream.id}. Tracks count: ${audioTracks.length}`);
+        audioTracks.forEach((track, i) => {
+          logger.webrtc(`[VOICE_DIAGNOSTICS] Track ${i}: label=${track.label}, enabled=${track.enabled}, readyState=${track.readyState}, muted=${track.muted}`);
+        });
+      }
       
       this.isMuted = false;
       if (this.listeners.onLocalAudioToggle) {
@@ -94,7 +122,39 @@ export class MockWebRTCService implements WebRTCService {
     this.dataChannels.set(peerId, dataChannel);
 
     dataChannel.onopen = () => {
+      const state = useRoomStore.getState();
+      const isHost = state.room?.hostId === state.participantId;
+      if (isHost) {
+        logLocalFileE2E('[HOST][DATA_CHANNEL]', { targetId: peerId });
+        console.log("[VIDEO_DEBUG][LOCAL][DATA_CHANNEL]", {
+          peerId,
+          readyState: dataChannel.readyState
+        });
+      } else {
+        logLocalFileE2E('[GUEST][DATA_CHANNEL_STATE]');
+        console.log("[VIDEO_DEBUG][LOCAL][GUEST_DATA_CHANNEL]", {
+          readyState: dataChannel.readyState
+        });
+      }
+      console.log("[VIDEO_TRACE][DATA_CHANNEL]", {
+        peerId,
+        label: 'cineroom-p2p-media',
+        readyState: dataChannel.readyState
+      });
       logger.webrtc(`DataChannel 'cineroom-p2p-media' opened with peer [${peerId}].`);
+
+      if (!isHost && peerId === state.room?.hostId) {
+        const fileId = state.p2pActiveFileId;
+        if (fileId && state.p2pProgress < 100) {
+          // Find first missing chunk index
+          let firstMissing = 0;
+          while (state.p2pBufferedChunks.has(firstMissing)) {
+            firstMissing++;
+          }
+          logLocalFileE2E('[GUEST][DATA_CHANNEL_OPEN_RETRY_TRIGGER]', { chunkIndex: firstMissing });
+          this.requestFileChunk(fileId, firstMissing);
+        }
+      }
       if (this.activeSubtitle) {
         dataChannel.send(JSON.stringify({
           type: 'CUSTOM_DATA',
@@ -129,12 +189,51 @@ export class MockWebRTCService implements WebRTCService {
           const msg = JSON.parse(data);
           if (msg.type === 'REQUEST_CHUNK') {
             const { fileId, index } = msg;
+            
+            const state = useRoomStore.getState();
+            const roomId = state.room?.id || 'unknown';
+            const participantId = state.participantId;
+            const fileSize = this.streamingFile ? this.streamingFile.size : 0;
+
+            logLocalFileE2E('[HOST][CHUNK_REQUEST_RECEIVED]', {
+              targetId: senderId,
+              chunkIndex: index
+            });
+
+            console.log("[VIDEO_DEBUG][LOCAL][CHUNK_REQUEST]", {
+              requesterId: senderId,
+              chunkIndex: index,
+              start: index * 65536,
+              end: Math.min(fileSize, (index + 1) * 65536)
+            });
+
+            console.log("[VIDEO_DEBUG][HOST][CHUNK_REQUEST]", {
+              roomId,
+              senderId,
+              targetId: participantId,
+              hostId: participantId,
+              participantId,
+              chunkIndex: index,
+              chunkSize: 65536,
+              fileSize
+            });
+
+            console.log("[VIDEO_TRACE][HOST] CHUNK_REQUEST_RECEIVED", {
+              senderId,
+              fileId,
+              index
+            });
             if (this.streamingFile) {
               const file = this.streamingFile;
               const totalChunks = Math.ceil(file.size / 65536);
               const start = index * 65536;
               const end = Math.min(file.size, start + 65536);
               const slice = file.slice(start, end);
+
+              logLocalFileE2E('[HOST][CHUNK_READ]', {
+                targetId: senderId,
+                chunkIndex: index
+              });
 
               const reader = new FileReader();
               reader.onload = () => {
@@ -147,6 +246,32 @@ export class MockWebRTCService implements WebRTCService {
                       setTimeout(sendChunk, 50); // backoff retry
                       return;
                     }
+                    logLocalFileE2E('[HOST][CHUNK_SENT]', {
+                      targetId: senderId,
+                      chunkIndex: index,
+                      bytesReceived: buffer.byteLength
+                    });
+                    console.log("[VIDEO_DEBUG][LOCAL][CHUNK_SENT]", {
+                      targetId: senderId,
+                      chunkIndex: index,
+                      bytesSent: buffer.byteLength
+                    });
+                    console.log("[VIDEO_DEBUG][HOST][CHUNK_SENT]", {
+                      roomId,
+                      senderId: participantId,
+                      targetId: senderId,
+                      hostId: participantId,
+                      participantId,
+                      chunkIndex: index,
+                      chunkSize: buffer.byteLength,
+                      fileSize
+                    });
+                    console.log("[VIDEO_TRACE][HOST] CHUNK_SENT", {
+                      recipientId: senderId,
+                      fileId,
+                      index,
+                      chunkSize: buffer.byteLength
+                    });
                     channel.send(`HEADER:${fileId}:${index}:${totalChunks}:${buffer.byteLength}`);
                     channel.send(buffer);
                   };
@@ -179,24 +304,119 @@ export class MockWebRTCService implements WebRTCService {
           this.receivedChunkBuffers.clear();
         }
 
-        this.receivedChunkBuffers.set(header.index, data);
+        const processBufferAndContinue = (arrayBuffer: ArrayBuffer) => {
+          const uint8Array = new Uint8Array(arrayBuffer);
+          this.receivedChunkBuffers.set(header.index, arrayBuffer);
 
-        if (this.listeners.onChunkReceived) {
-          this.listeners.onChunkReceived({
-            fileId: header.fileId,
+          let totalReceivedBytes = 0;
+          this.receivedChunkBuffers.forEach((buf) => {
+            totalReceivedBytes += buf.byteLength;
+          });
+
+          const state = useRoomStore.getState();
+          const roomId = state.room?.id || 'unknown';
+          const participantId = state.participantId;
+          const hostId = state.room?.hostId || 'unknown';
+          const fileSize = state.playbackState.fileSize;
+
+          logLocalFileE2E('[GUEST][CHUNK_RECEIVED]', {
+            chunkIndex: header.index,
+            bytesReceived: uint8Array.byteLength,
+            totalChunks: header.totalChunks,
+            totalBytes: header.size
+          });
+
+          logLocalFileE2E('[GUEST][CHUNK_STORED]', {
             chunkIndex: header.index,
             totalChunks: header.totalChunks,
-            buffer: data
+            totalBytes: header.size
           });
-        }
 
-        if (this.listeners.onTransferProgress) {
-          const progress = Math.round((this.receivedChunkBuffers.size / header.totalChunks) * 100);
-          this.listeners.onTransferProgress({
-            fileId: header.fileId,
-            progress,
-            receivedBytes: this.receivedChunkBuffers.size * 65536
+          logLocalFileE2E('[GUEST][BUFFER_PROGRESS]', {
+            chunkIndex: header.index,
+            totalChunks: header.totalChunks,
+            bytesReceived: totalReceivedBytes,
+            totalBytes: header.size
           });
+
+          console.log("[VIDEO_DEBUG][LOCAL][GUEST_CHUNK_RECEIVED]", {
+            chunkIndex: header.index,
+            bytesReceived: uint8Array.byteLength
+          });
+
+          console.log("[VIDEO_DEBUG][LOCAL][GUEST_PROGRESS]", {
+            receivedBytes: totalReceivedBytes,
+            expectedBytes: header.size,
+            percentage: Math.round((totalReceivedBytes / header.size) * 100)
+          });
+
+          console.log("[VIDEO_DEBUG][GUEST][CHUNK_RECEIVED]", {
+            roomId,
+            senderId,
+            targetId: participantId,
+            hostId,
+            participantId,
+            chunkIndex: header.index,
+            chunkSize: uint8Array.byteLength,
+            fileSize
+          });
+
+          console.log("[VIDEO_DEBUG][GUEST][TOTAL_BYTES]", {
+            roomId,
+            senderId,
+            targetId: participantId,
+            hostId,
+            participantId,
+            chunkIndex: header.index,
+            chunkSize: totalReceivedBytes,
+            fileSize
+          });
+
+          console.log("[VIDEO_TRACE][GUEST] CHUNK_RECEIVED", {
+            fileId: header.fileId,
+            index: header.index,
+            totalChunks: header.totalChunks,
+            chunkSize: uint8Array.byteLength
+          });
+
+          console.log("[VIDEO_TRACE][GUEST] TOTAL_BYTES", {
+            fileId: header.fileId,
+            receivedBytes: totalReceivedBytes,
+            expectedSize: header.size
+          });
+
+          if (this.listeners.onChunkReceived) {
+            this.listeners.onChunkReceived({
+              fileId: header.fileId,
+              chunkIndex: header.index,
+              totalChunks: header.totalChunks,
+              buffer: uint8Array.buffer
+            });
+          }
+
+          if (this.listeners.onTransferProgress) {
+            const progress = Math.round((this.receivedChunkBuffers.size / header.totalChunks) * 100);
+            this.listeners.onTransferProgress({
+              fileId: header.fileId,
+              progress,
+              receivedBytes: totalReceivedBytes
+            });
+          }
+        };
+
+        if (data instanceof Blob) {
+          const reader = new FileReader();
+          reader.onload = () => {
+            processBufferAndContinue(reader.result as ArrayBuffer);
+          };
+          reader.readAsArrayBuffer(data);
+        } else if (data instanceof Uint8Array) {
+          const slice = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+          processBufferAndContinue(slice);
+        } else if (data instanceof ArrayBuffer) {
+          processBufferAndContinue(data);
+        } else {
+          console.error("Unsupported binary type received on WebRTC data channel:", data);
         }
       }
     }
@@ -205,6 +425,12 @@ export class MockWebRTCService implements WebRTCService {
   public async startStreamingFile(file: File | null): Promise<void> {
     this.streamingFile = file;
     if (file) {
+      console.log("[VIDEO_TRACE][HOST] file selected", {
+        fileName: file.name,
+        fileSize: file.size,
+        fileType: file.type,
+        videoId: useRoomStore.getState().playbackState.videoId || 'unknown'
+      });
       logger.webrtc(`Loaded local file for P2P streaming: ${file.name} (${file.size} bytes)`);
     } else {
       logger.webrtc(`Cleared local file for P2P streaming.`);
@@ -213,25 +439,27 @@ export class MockWebRTCService implements WebRTCService {
   }
 
   public requestFileChunk(fileId: string, index: number): void {
-    // Lookup host ID circular-dependency-free from localStorage
-    const sessionStr = localStorage.getItem('cineroom_active_session');
-    if (!sessionStr) return;
-
     try {
-      const session = JSON.parse(sessionStr);
-      const roomId = session.roomId;
-      if (!roomId) return;
+      const state = useRoomStore.getState();
+      const hostId = state.room?.hostId;
+      const participantId = state.participantId;
 
-      const roomStr = localStorage.getItem(`cineroom_room_${roomId}`);
-      if (!roomStr) return;
+      if (hostId && hostId !== participantId) {
+        logLocalFileE2E('[GUEST][CHUNK_REQUEST_SENT]', {
+          chunkIndex: index
+        });
 
-      const room = JSON.parse(roomStr);
-      const hostId = room.hostId;
-
-      if (hostId && hostId !== session.participantId) {
         const channel = this.dataChannels.get(hostId);
         if (channel && channel.readyState === 'open') {
           channel.send(JSON.stringify({ type: 'REQUEST_CHUNK', fileId, index }));
+        } else {
+          // Retry automatically after a short delay if channel is still connecting
+          setTimeout(() => {
+            const ch = this.dataChannels.get(hostId);
+            if (ch && ch.readyState === 'open') {
+              ch.send(JSON.stringify({ type: 'REQUEST_CHUNK', fileId, index }));
+            }
+          }, 600);
         }
       }
     } catch (err: any) {
@@ -242,7 +470,15 @@ export class MockWebRTCService implements WebRTCService {
   // --- PEER ESTABLISHMENT MESH ---
 
   public async connectToPeer(peerId: string, peerName: string): Promise<void> {
-    if (this.pcs.has(peerId)) return;
+    if (this.pcs.has(peerId)) {
+      const existingPc = this.pcs.get(peerId);
+      if (existingPc && (existingPc.connectionState === 'closed' || existingPc.connectionState === 'failed' || existingPc.connectionState === 'disconnected')) {
+        logger.webrtc(`Cleaning up stale/failed PeerConnection for peer [${peerId}] before reconnecting.`);
+        this.disconnectFromPeer(peerId);
+      } else {
+        return;
+      }
+    }
 
     logger.webrtc(`Initiating RTCPeerConnection mesh track to [${peerName}] (${peerId}).`);
 
@@ -257,11 +493,31 @@ export class MockWebRTCService implements WebRTCService {
       }
     }
     if (iceServers.length === 0) {
-      iceServers.push({ urls: 'stun:stun.l.google.com:19302' }); // Fallback STUN
+      iceServers.push(
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun3.l.google.com:19302' },
+        { urls: 'stun:stun4.l.google.com:19302' }
+      );
     }
 
     const pc = new RTCPeerConnection({ iceServers });
     this.pcs.set(peerId, pc);
+
+    console.log("[VIDEO_DEBUG][GUEST][PEER]", {
+      peerId,
+      connectionState: pc.connectionState,
+      iceConnectionState: pc.iceConnectionState
+    });
+
+    console.log("[VOICE][PC]", {
+      peerId,
+      connectionState: pc.connectionState,
+      iceConnectionState: pc.iceConnectionState,
+      iceGatheringState: pc.iceGatheringState,
+      signalingState: pc.signalingState
+    });
 
     // Negotiate file transfer data channel
     this.setupDataChannel(peerId, pc);
@@ -270,19 +526,78 @@ export class MockWebRTCService implements WebRTCService {
     if (this.localStream) {
       this.localStream.getTracks().forEach((track) => {
         pc.addTrack(track, this.localStream!);
+        console.log("[VOICE_DEBUG][ADD_TRACK]", {
+          peerId,
+          trackId: track.id,
+          kind: track.kind
+        });
+        console.log("[VOICE_TRACE] ADD_TRACK", {
+          peerId,
+          trackId: track.id,
+          kind: track.kind
+        });
       });
     }
+
+    // Verify audio sender immediately
+    const senders = pc.getSenders();
+    const audioSender = senders.find(s => s.track && s.track.kind === 'audio');
+    console.log("[VOICE][SENDER]", {
+      hasAudioSender: !!audioSender,
+      trackId: audioSender?.track?.id,
+      kind: audioSender?.track?.kind,
+      enabled: audioSender?.track?.enabled,
+      readyState: audioSender?.track?.readyState
+    });
+
+    const getCandidateType = (candStr: string) => {
+      const match = candStr.match(/typ\s+(\w+)/);
+      return match ? match[1] : 'unknown';
+    };
 
     // ICE Candidate gathering
     pc.onicecandidate = (event) => {
       if (event.candidate) {
+        console.log("[VOICE_DEBUG][ICE_SENT]", {
+          senderId: this.localUserId,
+          targetId: peerId,
+          type: 'candidate',
+          peerConnectionState: pc.connectionState,
+          signalingState: pc.signalingState,
+          payloadValidity: !!event.candidate
+        });
+        console.log("[VOICE_TRACE] ICE_STATE", {
+          event: 'candidate_gathered',
+          candidate: event.candidate.candidate,
+          type: getCandidateType(event.candidate.candidate)
+        });
+        console.log("[VOICE][SIGNAL] ICE sent", {
+          candidate: event.candidate.candidate,
+          type: getCandidateType(event.candidate.candidate)
+        });
         realtimeService.sendSignaling(peerId, 'candidate', event.candidate);
       }
     };
 
     // Track state switches
     pc.onconnectionstatechange = () => {
-      logger.webrtc(`Connection state with [${peerName}] shifted to: ${pc.connectionState}`);
+      console.log("[VOICE_DEBUG][CONNECTION_STATE]", {
+        peerId,
+        connectionState: pc.connectionState
+      });
+      console.log("[VOICE_TRACE] CONNECTION_STATE", {
+        peerId,
+        connectionState: pc.connectionState,
+        signalingState: pc.signalingState
+      });
+      console.log("[VOICE][PC] connectionStateChanged", {
+        peerId,
+        connectionState: pc.connectionState,
+        iceConnectionState: pc.iceConnectionState,
+        iceGatheringState: pc.iceGatheringState,
+        signalingState: pc.signalingState
+      });
+      logger.webrtc(`[WEBRTC_DIAGNOSTICS] PC with [${peerName}] state changed: connectionState=${pc.connectionState}, iceConnectionState=${pc.iceConnectionState}, signalingState=${pc.signalingState}, iceGatheringState=${pc.iceGatheringState}`);
       this.notifyPeersChange();
       
       if (pc.connectionState === 'connected') {
@@ -290,17 +605,74 @@ export class MockWebRTCService implements WebRTCService {
       }
     };
 
+    pc.oniceconnectionstatechange = () => {
+      console.log("[VOICE_DEBUG][ICE_STATE]", {
+        peerId,
+        iceConnectionState: pc.iceConnectionState
+      });
+      console.log("[VOICE_TRACE] ICE_STATE", {
+        event: 'connection_state_change',
+        iceConnectionState: pc.iceConnectionState
+      });
+      console.log("[VOICE][PC] iceConnectionStateChanged", {
+        peerId,
+        iceConnectionState: pc.iceConnectionState
+      });
+    };
+
     // Track additions
     pc.ontrack = (event) => {
-      logger.webrtc(`Remote audio stream track received from [${peerName}].`);
-      const remoteStream = event.streams[0];
+      console.log("[VOICE_DEBUG][REMOTE_TRACK]", {
+        peerId,
+        trackId: event.track.id,
+        kind: event.track.kind
+      });
+      console.log("[VOICE_TRACE] REMOTE_TRACK", {
+        peerId,
+        kind: event.track.kind,
+        readyState: event.track.readyState,
+        streamsLength: event.streams.length
+      });
+      console.log("[VOICE][REMOTE_TRACK]", {
+        peerId,
+        kind: event.track.kind,
+        readyState: event.track.readyState,
+        streamsLength: event.streams.length
+      });
+      let remoteStream = event.streams[0];
+      if (!remoteStream) {
+        remoteStream = new MediaStream();
+        remoteStream.addTrack(event.track);
+      }
+      console.log("[VOICE_DEBUG][REMOTE_STREAM]", {
+        peerId,
+        streamId: remoteStream.id
+      });
+      console.log("[VOICE_TRACE] REMOTE_STREAM", {
+        streamId: remoteStream.id,
+        tracksCount: remoteStream.getTracks().length
+      });
       this.playRemoteAudio(peerId, remoteStream);
     };
 
     // Create SDP Offer
     try {
       const offer = await pc.createOffer();
+      console.log("[VOICE_DEBUG][OFFER_CREATED]", {
+        peerId,
+        sdp: offer.sdp
+      });
       await pc.setLocalDescription(offer);
+      console.log("[VOICE_DEBUG][OFFER_SENT]", {
+        senderId: this.localUserId,
+        targetId: peerId,
+        type: 'offer',
+        peerConnectionState: pc.connectionState,
+        signalingState: pc.signalingState,
+        payloadValidity: !!offer
+      });
+      console.log("[VOICE_TRACE] OFFER_SENT", { peerId });
+      console.log("[VOICE][SIGNAL] offer sent", { peerId });
       realtimeService.sendSignaling(peerId, 'offer', offer);
       this.notifyPeersChange();
     } catch (err: any) {
@@ -334,6 +706,8 @@ export class MockWebRTCService implements WebRTCService {
       this.audioElements.delete(peerId);
     }
 
+    this.queuedCandidates.delete(peerId);
+
     this.notifyPeersChange();
   }
 
@@ -343,6 +717,15 @@ export class MockWebRTCService implements WebRTCService {
 
     let pc = this.pcs.get(senderId);
 
+    if (pc && type === 'offer') {
+      const state = pc.connectionState;
+      if (state === 'closed' || state === 'failed' || state === 'disconnected') {
+        logger.webrtc(`Recreating closed/failed PeerConnection for [${senderId}] due to new incoming offer.`);
+        this.disconnectFromPeer(senderId);
+        pc = undefined;
+      }
+    }
+
     if (!pc) {
       // Setup connection if not initialized
       const iceServers: RTCIceServer[] = [];
@@ -351,11 +734,31 @@ export class MockWebRTCService implements WebRTCService {
         try { iceServers.push(...JSON.parse(envServers)); } catch {}
       }
       if (iceServers.length === 0) {
-        iceServers.push({ urls: 'stun:stun.l.google.com:19302' });
+        iceServers.push(
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' },
+          { urls: 'stun:stun3.l.google.com:19302' },
+          { urls: 'stun:stun4.l.google.com:19302' }
+        );
       }
 
       pc = new RTCPeerConnection({ iceServers });
       this.pcs.set(senderId, pc);
+
+      console.log("[VIDEO_DEBUG][GUEST][PEER]", {
+        peerId: senderId,
+        connectionState: pc.connectionState,
+        iceConnectionState: pc.iceConnectionState
+      });
+
+      console.log("[VOICE][PC]", {
+        senderId,
+        connectionState: pc.connectionState,
+        iceConnectionState: pc.iceConnectionState,
+        iceGatheringState: pc.iceGatheringState,
+        signalingState: pc.signalingState
+      });
 
       // Negotiate file transfer data channel
       this.setupDataChannel(senderId, pc);
@@ -363,40 +766,263 @@ export class MockWebRTCService implements WebRTCService {
       if (this.localStream) {
         this.localStream.getTracks().forEach((track) => {
           pc!.addTrack(track, this.localStream!);
+          console.log("[VOICE_DEBUG][ADD_TRACK]", {
+            peerId: senderId,
+            trackId: track.id,
+            kind: track.kind
+          });
+          console.log("[VOICE_TRACE] ADD_TRACK", {
+            peerId: senderId,
+            trackId: track.id,
+            kind: track.kind
+          });
         });
       }
 
+      // Verify audio sender
+      const senders = pc.getSenders();
+      const audioSender = senders.find(s => s.track && s.track.kind === 'audio');
+      console.log("[VOICE][SENDER]", {
+        hasAudioSender: !!audioSender,
+        trackId: audioSender?.track?.id,
+        kind: audioSender?.track?.kind,
+        enabled: audioSender?.track?.enabled,
+        readyState: audioSender?.track?.readyState
+      });
+
+      const getCandidateType = (candStr: string) => {
+        const match = candStr.match(/typ\s+(\w+)/);
+        return match ? match[1] : 'unknown';
+      };
+
       pc.onicecandidate = (event) => {
         if (event.candidate) {
+          console.log("[VOICE_DEBUG][ICE_SENT]", {
+            senderId: this.localUserId,
+            targetId: senderId,
+            type: 'candidate',
+            peerConnectionState: pc!.connectionState,
+            signalingState: pc!.signalingState,
+            payloadValidity: !!event.candidate
+          });
+          console.log("[VOICE_TRACE] ICE_STATE", {
+            event: 'candidate_gathered',
+            candidate: event.candidate.candidate,
+            type: getCandidateType(event.candidate.candidate)
+          });
+          console.log("[VOICE][SIGNAL] ICE sent", {
+            candidate: event.candidate.candidate,
+            type: getCandidateType(event.candidate.candidate)
+          });
           realtimeService.sendSignaling(senderId, 'candidate', event.candidate);
         }
       };
 
       pc.onconnectionstatechange = () => {
-        logger.webrtc(`Connection state with [${senderId}] shifted to: ${pc!.connectionState}`);
+        console.log("[VOICE_DEBUG][CONNECTION_STATE]", {
+          peerId: senderId,
+          connectionState: pc!.connectionState
+        });
+        console.log("[VOICE_TRACE] CONNECTION_STATE", {
+          peerId: senderId,
+          connectionState: pc!.connectionState,
+          signalingState: pc!.signalingState
+        });
+        console.log("[VOICE][PC] connectionStateChanged", {
+          senderId,
+          connectionState: pc!.connectionState,
+          iceConnectionState: pc!.iceConnectionState,
+          iceGatheringState: pc!.iceGatheringState,
+          signalingState: pc!.signalingState
+        });
+        logger.webrtc(`[WEBRTC_DIAGNOSTICS] PC with [${senderId}] state changed: connectionState=${pc!.connectionState}, iceConnectionState=${pc!.iceConnectionState}, signalingState=${pc!.signalingState}, iceGatheringState=${pc!.iceGatheringState}`);
         this.notifyPeersChange();
       };
 
+      pc.oniceconnectionstatechange = () => {
+        console.log("[VOICE_DEBUG][ICE_STATE]", {
+          peerId: senderId,
+          iceConnectionState: pc!.iceConnectionState
+        });
+        console.log("[VOICE_TRACE] ICE_STATE", {
+          event: 'connection_state_change',
+          iceConnectionState: pc!.iceConnectionState
+        });
+        console.log("[VOICE][PC] iceConnectionStateChanged", {
+          senderId,
+          iceConnectionState: pc!.iceConnectionState
+        });
+      };
+
       pc.ontrack = (event) => {
-        logger.webrtc(`Remote audio stream track received from [${senderId}].`);
-        this.playRemoteAudio(senderId, event.streams[0]);
+        console.log("[VOICE_DEBUG][REMOTE_TRACK]", {
+          peerId: senderId,
+          trackId: event.track.id,
+          kind: event.track.kind
+        });
+        console.log("[VOICE_TRACE] REMOTE_TRACK", {
+          peerId: senderId,
+          kind: event.track.kind,
+          readyState: event.track.readyState,
+          streamsLength: event.streams.length
+        });
+        console.log("[VOICE][REMOTE_TRACK]", {
+          senderId,
+          kind: event.track.kind,
+          readyState: event.track.readyState,
+          streamsLength: event.streams.length
+        });
+        let remoteStream = event.streams[0];
+        if (!remoteStream) {
+          remoteStream = new MediaStream();
+          remoteStream.addTrack(event.track);
+        }
+        console.log("[VOICE_DEBUG][REMOTE_STREAM]", {
+          peerId: senderId,
+          streamId: remoteStream.id
+        });
+        console.log("[VOICE_TRACE] REMOTE_STREAM", {
+          streamId: remoteStream.id,
+          tracksCount: remoteStream.getTracks().length
+        });
+        this.playRemoteAudio(senderId, remoteStream);
       };
     }
 
     try {
       if (type === 'offer') {
-        await pc.setRemoteDescription(new RTCSessionDescription(payload));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        realtimeService.sendSignaling(senderId, 'answer', answer);
+        console.log("[VOICE_DEBUG][OFFER_RECEIVED]", {
+          senderId,
+          targetId: this.localUserId,
+          type: 'offer',
+          peerConnectionState: pc.connectionState,
+          signalingState: pc.signalingState,
+          payloadValidity: !!payload
+        });
+        console.log("[VOICE_TRACE] OFFER_RECEIVED", { senderId });
+        console.log("[VOICE][SIGNAL] offer received", { senderId });
+        if (pc.signalingState === 'have-remote-offer' || pc.connectionState === 'connected') {
+          console.log("[VOICE_TRACE] OFFER_RECEIVED duplicate ignored (state: " + pc.signalingState + ")");
+        } else {
+          await pc.setRemoteDescription(new RTCSessionDescription(payload));
+          console.log("[VOICE_DEBUG][REMOTE_DESCRIPTION]", {
+            peerId: senderId,
+            type: 'offer',
+            signalingState: pc.signalingState
+          });
+          const answer = await pc.createAnswer();
+          console.log("[VOICE_DEBUG][ANSWER_CREATED]", {
+            peerId: senderId,
+            sdp: answer.sdp
+          });
+          await pc.setLocalDescription(answer);
+          console.log("[VOICE_DEBUG][ANSWER_SENT]", {
+            senderId: this.localUserId,
+            targetId: senderId,
+            type: 'answer',
+            peerConnectionState: pc.connectionState,
+            signalingState: pc.signalingState,
+            payloadValidity: !!answer
+          });
+          console.log("[VOICE_TRACE] ANSWER_SENT", { senderId });
+          console.log("[VOICE][SIGNAL] answer sent", { senderId });
+          realtimeService.sendSignaling(senderId, 'answer', answer);
+          await this.processQueuedCandidates(senderId, pc);
+        }
       } else if (type === 'answer') {
-        await pc.setRemoteDescription(new RTCSessionDescription(payload));
+        console.log("[VOICE_DEBUG][ANSWER_RECEIVED]", {
+          senderId,
+          targetId: this.localUserId,
+          type: 'answer',
+          peerConnectionState: pc.connectionState,
+          signalingState: pc.signalingState,
+          payloadValidity: !!payload
+        });
+        console.log("[VOICE_TRACE] ANSWER_RECEIVED", { senderId });
+        console.log("[VOICE][SIGNAL] answer received", { senderId });
+        if (pc.signalingState === 'stable') {
+          console.log("[VOICE_TRACE] ANSWER_RECEIVED duplicate ignored (already stable)");
+        } else {
+          await pc.setRemoteDescription(new RTCSessionDescription(payload));
+          console.log("[VOICE_DEBUG][REMOTE_DESCRIPTION]", {
+            peerId: senderId,
+            type: 'answer',
+            signalingState: pc.signalingState
+          });
+          await this.processQueuedCandidates(senderId, pc);
+        }
       } else if (type === 'candidate') {
-        await pc.addIceCandidate(new RTCIceCandidate(payload));
+        if (!payload) {
+          logger.info(`Received empty ICE candidate signalling payload from [${senderId}]. Ignored.`);
+          return;
+        }
+        const getCandidateType = (candStr: string) => {
+          if (!candStr) return 'unknown';
+          const match = candStr.match(/typ\s+(\w+)/);
+          return match ? match[1] : 'unknown';
+        };
+        const candType = getCandidateType(payload.candidate);
+        console.log("[VOICE_DEBUG][ICE_RECEIVED]", {
+          senderId,
+          targetId: this.localUserId,
+          type: 'candidate',
+          peerConnectionState: pc.connectionState,
+          signalingState: pc.signalingState,
+          payloadValidity: !!payload
+        });
+        console.log("[VOICE_TRACE] ICE_STATE", {
+          event: 'candidate_received',
+          candidate: payload.candidate,
+          type: candType
+        });
+        console.log("[VOICE][SIGNAL] ICE received", { senderId, type: candType });
+
+        if (!payload.candidate) {
+          logger.info(`Null candidate (ICE gathering complete) received from [${senderId}]. Ignored.`);
+          return;
+        }
+
+        if (!pc.remoteDescription) {
+          console.log("[VOICE_TRACE] ICE_STATE", {
+            event: 'candidate_queued',
+            senderId
+          });
+          let queue = this.queuedCandidates.get(senderId);
+          if (!queue) {
+            queue = [];
+            this.queuedCandidates.set(senderId, queue);
+          }
+          queue.push(payload);
+        } else {
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate(payload));
+          } catch (e: any) {
+            logger.error(`Failed to add ICE candidate from [${senderId}]:`, e.message);
+          }
+        }
       }
       this.notifyPeersChange();
     } catch (err: any) {
       logger.error(`Failed to apply signaling payload from [${senderId}].`, err.message);
+    }
+  }
+
+  private async processQueuedCandidates(peerId: string, pc: RTCPeerConnection) {
+    const queue = this.queuedCandidates.get(peerId);
+    if (queue && queue.length > 0) {
+      console.log("[VOICE_TRACE] ICE_STATE", {
+        event: 'applying_queued_candidates',
+        peerId,
+        count: queue.length
+      });
+      for (const candidate of queue) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (err: any) {
+          logger.error(`Failed to apply queued ICE candidate for [${peerId}]:`, err.message);
+        }
+      }
+      this.queuedCandidates.set(peerId, []);
     }
   }
 
@@ -407,16 +1033,70 @@ export class MockWebRTCService implements WebRTCService {
     if (!audio) {
       audio = document.createElement('audio');
       audio.autoplay = true;
-      audio.style.display = 'none';
+      audio.setAttribute('playsinline', 'true');
+      audio.style.position = 'absolute';
+      audio.style.pointerEvents = 'none';
+      audio.style.opacity = '0';
+      audio.style.width = '0px';
+      audio.style.height = '0px';
       document.body.appendChild(audio);
       this.audioElements.set(peerId, audio);
     }
     
     audio.srcObject = stream;
-    
-    // Apply volume override
-    const vol = this.peerVolumes.has(peerId) ? this.peerVolumes.get(peerId)! : 0.8;
-    audio.volume = vol;
+    audio.muted = false;
+    audio.volume = 1.0; // Standardize voice call playback volume
+
+    console.log("[VOICE_DEBUG][AUDIO_PLAY]", {
+      event: 'attempt',
+      peerId,
+      srcObjectSet: !!audio.srcObject
+    });
+    console.log("[VOICE_TRACE] AUDIO_PLAY", {
+      event: 'attempt',
+      peerId,
+      srcObjectSet: !!audio.srcObject,
+      muted: audio.muted,
+      volume: audio.volume
+    });
+    console.log("[VOICE][PLAYBACK] Attempting to play remote peer audio", {
+      peerId,
+      streamId: stream.id,
+      muted: audio.muted,
+      volume: audio.volume,
+      srcObject: !!audio.srcObject
+    });
+
+    audio.play()
+      .then(() => {
+        console.log("[VOICE_DEBUG][AUDIO_PLAY]", {
+          event: 'success',
+          peerId
+        });
+        console.log("[VOICE_TRACE] AUDIO_PLAY", {
+          event: 'success',
+          peerId
+        });
+        console.log("[VOICE][PLAYBACK] Remote audio playback STARTED successfully for peer:", peerId);
+      })
+      .catch((err: any) => {
+        console.log("[VOICE_DEBUG][AUDIO_PLAY]", {
+          event: 'failed',
+          peerId,
+          error: err.message
+        });
+        console.log("[VOICE_TRACE] AUDIO_PLAY", {
+          event: 'failed',
+          peerId,
+          errorName: err.name,
+          errorMessage: err.message
+        });
+        console.error("[VOICE][PLAYBACK] Remote audio playback FAILED for peer:", peerId, {
+          name: err.name,
+          message: err.message,
+          code: err.code
+        });
+      });
 
     if (this.listeners.onRemoteStreamReceived) {
       this.listeners.onRemoteStreamReceived({ peerId, stream });
@@ -548,6 +1228,7 @@ export class MockWebRTCService implements WebRTCService {
     // Close connections
     this.pcs.forEach((pc) => pc.close());
     this.pcs.clear();
+    this.queuedCandidates.clear();
 
     // Close data channels
     this.dataChannels.forEach((dc) => dc.close());
@@ -566,5 +1247,104 @@ export class MockWebRTCService implements WebRTCService {
     this.audioElements.clear();
 
     this.notifyPeersChange();
+  }
+
+  public hasPeerConnection(peerId: string): boolean {
+    return this.pcs.has(peerId);
+  }
+
+  public getDataChannelState(peerId: string): string | null {
+    const channel = this.dataChannels.get(peerId);
+    return channel ? channel.readyState : null;
+  }
+}
+
+export function logLocalFileE2E(stage: string, extra: { chunkIndex?: number; totalChunks?: number; bytesReceived?: number; totalBytes?: number; errorMsg?: string; targetId?: string } = {}) {
+  try {
+    const state = useRoomStore.getState();
+    const roomId = state.room?.id || 'unknown';
+    const hostId = state.room?.hostId || 'unknown';
+    const participantId = state.participantId || 'unknown';
+    const guestId = hostId === participantId ? 'host' : participantId;
+    const fileName = state.playbackState.fileName || 'unknown';
+    const fileSize = state.playbackState.fileSize || 0;
+    
+    let mimeType = 'video/mp4';
+    const nameLower = fileName.toLowerCase();
+    if (nameLower.endsWith('.webm')) {
+      mimeType = 'video/webm';
+    } else if (nameLower.endsWith('.mkv')) {
+      mimeType = 'video/x-matroska';
+    } else if (nameLower.endsWith('.ogg') || nameLower.endsWith('.ogv')) {
+      mimeType = 'video/ogg';
+    } else if (nameLower.endsWith('.mov')) {
+      mimeType = 'video/quicktime';
+    }
+
+    const targetId = hostId === participantId ? extra.targetId || 'unknown' : hostId;
+    const dcState = activeInstance ? activeInstance.getDataChannelState(targetId) || 'closed' : 'closed';
+
+    console.log(`[LOCAL_FILE_E2E]${stage}`, {
+      roomId,
+      hostId,
+      guestId,
+      fileName,
+      fileSize,
+      mimeType,
+      chunkIndex: extra.chunkIndex !== undefined ? extra.chunkIndex : -1,
+      totalChunks: extra.totalChunks !== undefined ? extra.totalChunks : -1,
+      bytesReceived: extra.bytesReceived !== undefined ? extra.bytesReceived : -1,
+      totalBytes: extra.totalBytes !== undefined ? extra.totalBytes : -1,
+      dataChannelReadyState: dcState,
+      ...extra
+    });
+  } catch (err: any) {
+    console.error('Error in logLocalFileE2E:', err.message);
+  }
+}
+
+export function logLocalTransfer(stage: string, extra: { peerId?: string; chunkIndex?: number; totalChunks?: number; start?: number; end?: number; bytes?: number; totalBytes?: number } = {}) {
+  try {
+    const state = useRoomStore.getState();
+    const roomId = state.room?.id || 'unknown';
+    const hostId = state.room?.hostId || 'unknown';
+    const participantId = state.participantId || 'unknown';
+    const guestId = hostId === participantId ? 'host' : participantId;
+    const peerId = extra.peerId || (hostId === participantId ? 'unknown' : hostId);
+
+    const channel = activeInstance ? (activeInstance as any).dataChannels?.get(peerId) : null;
+    const channelLabel = channel ? channel.label : 'none';
+    const channelReadyState = channel ? channel.readyState : 'closed';
+
+    let mimeType = 'video/mp4';
+    const fileName = state.playbackState.fileName || 'unknown';
+    const nameLower = fileName.toLowerCase();
+    if (nameLower.endsWith('.webm')) {
+      mimeType = 'video/webm';
+    } else if (nameLower.endsWith('.mkv')) {
+      mimeType = 'video/x-matroska';
+    } else if (nameLower.endsWith('.ogg') || nameLower.endsWith('.ogv')) {
+      mimeType = 'video/ogg';
+    } else if (nameLower.endsWith('.mov')) {
+      mimeType = 'video/quicktime';
+    }
+
+    console.log(`[LOCAL_TRANSFER]${stage}`, {
+      roomId,
+      hostId,
+      guestId,
+      peerId,
+      channelLabel,
+      channelReadyState,
+      mimeType,
+      chunkIndex: extra.chunkIndex !== undefined ? extra.chunkIndex : -1,
+      totalChunks: extra.totalChunks !== undefined ? extra.totalChunks : -1,
+      start: extra.start !== undefined ? extra.start : -1,
+      end: extra.end !== undefined ? extra.end : -1,
+      bytes: extra.bytes !== undefined ? extra.bytes : -1,
+      totalBytes: extra.totalBytes !== undefined ? extra.totalBytes : (state.playbackState.fileSize || -1)
+    });
+  } catch (err: any) {
+    console.error('Error in logLocalTransfer:', err.message);
   }
 }

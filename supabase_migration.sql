@@ -270,3 +270,15 @@ BEGIN
   WHERE room_id = p_room_id;
 END;
 $$;
+
+-- 7. Update source_type check constraint on playback_states to support HLS, YouTube, Vimeo, Dailymotion, Aparat, and Generic Embed players
+ALTER TABLE playback_states 
+DROP CONSTRAINT IF EXISTS playback_states_source_type_check;
+
+ALTER TABLE playback_states 
+ADD CONSTRAINT playback_states_source_type_check 
+CHECK (source_type IN ('local', 'url', 'hls', 'youtube', 'vimeo', 'dailymotion', 'aparat', 'embed'));
+
+-- 8. Add support for chat message replies
+ALTER TABLE public.chat_messages 
+ADD COLUMN IF NOT EXISTS reply_to_id TEXT REFERENCES public.chat_messages(id) ON DELETE SET NULL;

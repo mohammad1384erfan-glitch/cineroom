@@ -1,4 +1,4 @@
-export type VideoSourceType = 'url' | 'local' | 'aparat';
+export type VideoSourceType = 'url' | 'local' | 'hls' | 'youtube' | 'aparat' | 'vimeo' | 'dailymotion' | 'embed';
 
 export interface UserPermissions {
   canPlayPause: boolean;
@@ -59,6 +59,8 @@ export interface ChatMessage {
   timestamp: number;
   videoTimestamp?: number;
   isSystem?: boolean;
+  replyToId?: string | null;
+  replyToMessage?: ChatMessage | null;
 }
 
 export interface Room {

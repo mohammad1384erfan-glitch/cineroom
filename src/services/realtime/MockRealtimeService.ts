@@ -36,12 +36,10 @@ export class MockRealtimeService implements RealtimeService {
   private sanitizeInput(input: string): string {
     if (!input) return '';
     return input
-      .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#x27;')
-      .replace(/\//g, '&#x2F;');
+      .replace(/'/g, '&#x27;');
   }
 
   private generateRoomId(): string {
@@ -355,7 +353,7 @@ export class MockRealtimeService implements RealtimeService {
       }
       case 'SIGNALING': {
         const { targetId, type, payload } = msg.payload;
-        if (targetId === this.localParticipantId && this.listeners.onSignalingMessage) {
+        if ((targetId === '*' || targetId === this.localParticipantId) && this.listeners.onSignalingMessage) {
           this.listeners.onSignalingMessage({ senderId: msg.senderId, type, payload });
         }
         break;
@@ -746,7 +744,7 @@ export class MockRealtimeService implements RealtimeService {
     const videoId = state.videoId !== undefined ? state.videoId : (state.sourceUrl !== undefined ? state.sourceUrl : current.videoId);
 
     const cleanFileName = state.fileName !== undefined ? (state.fileName ? this.sanitizeInput(state.fileName).slice(0, 100) : '') : current.fileName;
-    const cleanSourceUrl = state.sourceUrl !== undefined ? (state.sourceUrl ? this.sanitizeInput(state.sourceUrl).slice(0, 1000) : '') : current.sourceUrl;
+    const cleanSourceUrl = state.sourceUrl !== undefined ? (state.sourceUrl ? state.sourceUrl.trim().slice(0, 2000) : '') : current.sourceUrl;
 
     const updated: PlaybackState = {
       ...current,
@@ -770,7 +768,7 @@ export class MockRealtimeService implements RealtimeService {
     }
   }
 
-  public async sendChatMessage(content: string): Promise<void> {
+  public async sendChatMessage(content: string, replyToId?: string | null): Promise<void> {
     const roomId = this.activeRoomId;
     const self = this.getSelf();
     if (!roomId || !self) throw new Error('Not connected');
@@ -803,7 +801,8 @@ export class MockRealtimeService implements RealtimeService {
       senderAvatar: self.avatar,
       content: cleanContent,
       timestamp: Date.now(),
-      videoTimestamp
+      videoTimestamp,
+      replyToId: replyToId || null
     };
 
     chatMessages.push(chatMsg);
@@ -824,7 +823,7 @@ export class MockRealtimeService implements RealtimeService {
 
     const queue = this.getQueue(roomId);
     const cleanTitle = this.sanitizeInput(item.title.trim()).slice(0, 100);
-    const cleanUrl = this.sanitizeInput(item.url.trim()).slice(0, 1000);
+    const cleanUrl = item.url.trim().slice(0, 2000);
     const newItem: QueueItem = {
       ...item,
       title: cleanTitle,

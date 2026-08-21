@@ -12,8 +12,18 @@ export const realtimeService: RealtimeService = useMock
   ? new MockRealtimeService() 
   : new SupabaseRealtimeService();
 export const webrtcService: WebRTCService = new MockWebRTCService();
+export { logLocalFileE2E, logLocalTransfer } from './webrtc/MockWebRTCService';
 
 // Export types
 export * from './realtime/types';
 export * from './webrtc/types';
 export * from './diagnostics/logger';
+export * from './player/VideoSourceResolver';
+export * from './player/adapters/VideoPlayerAdapter';
+export * from './player/adapters/NativeVideoAdapter';
+export * from './player/adapters/HLSVideoAdapter';
+export * from './player/adapters/YouTubeAdapter';
+export * from './player/adapters/VimeoAdapter';
+export * from './player/adapters/DailymotionAdapter';
+export * from './player/adapters/AparatAdapter';
+export * from './player/adapters/GenericEmbedAdapter';

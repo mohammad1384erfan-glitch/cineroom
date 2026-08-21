@@ -1,5 +1,5 @@
 import { createClient, SupabaseClient, RealtimeChannel } from '@supabase/supabase-js';
-import type { Room, Participant, PlaybackState, QueueItem, RealtimeEventListeners, UserPermissions, ReactionEvent, ClientSession } from './types';
+import type { Room, Participant, PlaybackState, QueueItem, RealtimeEventListeners, UserPermissions, ReactionEvent, ClientSession, ChatMessage } from './types';
 import { RealtimeService } from './RealtimeService';
 import { logger } from '../diagnostics/logger';
 
@@ -12,6 +12,8 @@ export class SupabaseRealtimeService implements RealtimeService {
   private listeners: RealtimeEventListeners = {};
   private channel: RealtimeChannel | null = null;
   private reconnectTimers: Map<string, any> = new Map();
+  private reconnectAttempt = 0;
+  private reconnectTimer: any = null;
 
   constructor() {
     this.initClient();
@@ -47,12 +49,10 @@ export class SupabaseRealtimeService implements RealtimeService {
   private sanitizeInput(input: string): string {
     if (!input) return '';
     return input
-      .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#x27;')
-      .replace(/\//g, '&#x2F;');
+      .replace(/'/g, '&#x27;');
   }
 
   // --- FETCHERS ---
@@ -93,6 +93,50 @@ export class SupabaseRealtimeService implements RealtimeService {
       addedBy: q.added_by_name,
       avatar: q.added_by_avatar
     }));
+  }
+
+  private parseTimestamp(ts: any): number {
+    if (!ts) return Date.now();
+    if (typeof ts === 'number') return ts;
+    const num = Number(ts);
+    if (!isNaN(num)) return num;
+    const parsed = Date.parse(ts);
+    return isNaN(parsed) ? Date.now() : parsed;
+  }
+
+  private async fetchChatHistory(roomId: string): Promise<ChatMessage[]> {
+    const sb = this.checkSupabase();
+    const { data, error } = await sb
+      .from('chat_messages')
+      .select('*')
+      .eq('room_id', roomId)
+      .order('timestamp', { ascending: true })
+      .limit(100);
+
+    if (error) {
+      logger.error('Failed to fetch chat history:', error.message);
+      return [];
+    }
+
+    return (data || []).map(c => {
+      const parsedTs = this.parseTimestamp(c.timestamp);
+      console.log("[CHAT_TIMESTAMP][DB]", {
+        raw: c.timestamp,
+        parsed: parsedTs,
+        dateObject: new Date(parsedTs).toString()
+      });
+      return {
+        id: c.id,
+        senderId: c.sender_id,
+        senderName: c.sender_name,
+        senderAvatar: c.sender_avatar,
+        content: c.content,
+        timestamp: parsedTs,
+        videoTimestamp: c.video_timestamp,
+        isSystem: c.is_system,
+        replyToId: c.reply_to_id
+      };
+    });
   }
 
   private mapParticipant(p: any): Participant {
@@ -271,6 +315,13 @@ export class SupabaseRealtimeService implements RealtimeService {
 
     await this.subscribeToRoom(room.id);
 
+    const chatHistory = await this.fetchChatHistory(room.id);
+    setTimeout(() => {
+      chatHistory.forEach(msg => {
+        if (this.listeners.onChatMessage) this.listeners.onChatMessage(msg);
+      });
+    }, 400);
+
     return { room, participantId };
   }
 
@@ -369,18 +420,69 @@ export class SupabaseRealtimeService implements RealtimeService {
       const fileSize = state.fileSize || 0;
       const videoId = state.videoId || '';
 
-      const { error } = await sb.rpc('playback_change_video', {
+      // Fetch room hostId directly from DB to prevent circular dependencies
+      let hostId = 'unknown';
+      try {
+        const { data: roomData } = await sb.from('rooms').select('host_id').eq('id', roomId).single();
+        if (roomData) {
+          hostId = roomData.host_id;
+        }
+      } catch (e) {}
+
+      console.log("[VIDEO_DEBUG][SOURCE_SELECTED]", {
+        roomId,
+        participantId: this.localParticipantId,
+        hostId,
+        sourceType,
+        videoId,
+        sourceUrl,
+        fileName,
+        fileSize
+      });
+
+      const payload = {
         p_room_id: roomId,
         p_source_type: sourceType,
         p_source_url: sourceUrl,
         p_file_name: fileName,
         p_file_size: fileSize,
         p_video_id: videoId
-      });
+      };
+
+      const { data, error } = await sb.rpc('playback_change_video', payload);
       if (error) {
+        console.error("[VIDEO_PIPELINE]", {
+          stage: 'playback_change_video_rpc',
+          url: sourceUrl,
+          provider: sourceType,
+          sourceType: sourceType,
+          resolvedSource: { url: sourceUrl, type: sourceType, videoId },
+          rpc: 'playback_change_video',
+          payload,
+          error: {
+            message: error.message,
+            details: error.details,
+            hint: error.hint,
+            code: error.code
+          }
+        });
         logger.error('Failed to change video via RPC:', error.message);
         throw new Error(error.message);
       }
+
+      console.log("[VIDEO_DEBUG][RPC_SUCCESS]", {
+        rpc: 'playback_change_video',
+        payload,
+        response: data
+      });
+
+      if (sourceType !== 'local') {
+        console.log("[VIDEO_DEBUG][URL][RPC_SUCCESS]", {
+          sourceUrl,
+          sourceType
+        });
+      }
+
       return;
     }
 
@@ -390,16 +492,40 @@ export class SupabaseRealtimeService implements RealtimeService {
       const currentTime = state.currentTime !== undefined ? state.currentTime : 0;
       const eventId = state.eventId || 'evt-' + Math.random().toString(36).substring(2, 8);
 
-      const { error } = await sb.rpc('playback_play_pause', {
+      const payload = {
         p_room_id: roomId,
         p_is_playing: isPlaying,
         p_event_id: eventId,
         p_current_time: currentTime
-      });
+      };
+
+      const { data, error } = await sb.rpc('playback_play_pause', payload);
       if (error) {
+        console.error("[VIDEO_PIPELINE]", {
+          stage: 'playback_play_pause_rpc',
+          url: '',
+          provider: '',
+          sourceType: '',
+          resolvedSource: null,
+          rpc: 'playback_play_pause',
+          payload,
+          error: {
+            message: error.message,
+            details: error.details,
+            hint: error.hint,
+            code: error.code
+          }
+        });
         logger.error('Failed to update play/pause via RPC:', error.message);
         throw new Error(error.message);
       }
+
+      console.log("[VIDEO_DEBUG][RPC_SUCCESS]", {
+        rpc: 'playback_play_pause',
+        payload,
+        response: data
+      });
+
       return;
     }
 
@@ -408,20 +534,44 @@ export class SupabaseRealtimeService implements RealtimeService {
       const currentTime = state.currentTime;
       const eventId = state.eventId || 'evt-' + Math.random().toString(36).substring(2, 8);
 
-      const { error } = await sb.rpc('playback_seek', {
+      const payload = {
         p_room_id: roomId,
         p_current_time: currentTime,
         p_event_id: eventId
-      });
+      };
+
+      const { data, error } = await sb.rpc('playback_seek', payload);
       if (error) {
+        console.error("[VIDEO_PIPELINE]", {
+          stage: 'playback_seek_rpc',
+          url: '',
+          provider: '',
+          sourceType: '',
+          resolvedSource: null,
+          rpc: 'playback_seek',
+          payload,
+          error: {
+            message: error.message,
+            details: error.details,
+            hint: error.hint,
+            code: error.code
+          }
+        });
         logger.error('Failed to seek video via RPC:', error.message);
         throw new Error(error.message);
       }
+
+      console.log("[VIDEO_DEBUG][RPC_SUCCESS]", {
+        rpc: 'playback_seek',
+        payload,
+        response: data
+      });
+
       return;
     }
   }
 
-  public async sendChatMessage(content: string): Promise<void> {
+  public async sendChatMessage(content: string, replyToId?: string | null): Promise<void> {
     const roomId = this.activeRoomId;
     const participantId = this.localParticipantId;
     if (!roomId || !participantId) return;
@@ -442,17 +592,66 @@ export class SupabaseRealtimeService implements RealtimeService {
       videoTimestamp = Math.max(0, currentPos);
     }
 
-    await sb.from('chat_messages').insert({
-      id: 'msg-' + Math.random().toString(36).substring(2, 8),
+    const msgId = 'msg-' + Math.random().toString(36).substring(2, 8);
+    const msgTimestamp = Date.now();
+
+    const getChatDebugInfo = (ts: any) => {
+      const tsNum = Number(ts);
+      const date = new Date(tsNum);
+      const iso = isNaN(date.getTime()) ? 'Invalid Date' : date.toISOString();
+      const formatted = isNaN(date.getTime()) ? 'Invalid Date' : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+      return {
+        timestamp: ts,
+        typeofTimestamp: typeof ts,
+        isoRepresentation: iso,
+        formattedLocalTime: formatted
+      };
+    };
+
+    console.log("[CHAT_DEBUG][SEND]", {
+      messageId: msgId,
+      ...getChatDebugInfo(msgTimestamp)
+    });
+
+    console.log("[CHAT_TRACE]", {
+      stage: 'outgoing',
+      messageId: msgId,
+      timestamp: msgTimestamp,
+      timestampType: typeof msgTimestamp,
+      videoTimestamp: videoTimestamp || null,
+      senderId: participantId,
+      content: cleanContent
+    });
+
+    const { data: dbData } = await sb.from('chat_messages').insert({
+      id: msgId,
       room_id: roomId,
       sender_id: participantId,
       sender_name: this.localNickname,
       sender_avatar: this.localAvatar,
       content: cleanContent,
-      timestamp: Date.now(),
+      timestamp: msgTimestamp,
       video_timestamp: videoTimestamp || null,
-      is_system: false
-    });
+      is_system: false,
+      reply_to_id: replyToId || null
+    }).select();
+
+    if (dbData && dbData[0]) {
+      const dbRow = dbData[0];
+      console.log("[CHAT_DEBUG][DB]", {
+        messageId: dbRow.id,
+        ...getChatDebugInfo(dbRow.timestamp)
+      });
+      console.log("[CHAT_TRACE]", {
+        stage: 'database_row',
+        messageId: dbRow.id,
+        timestamp: Number(dbRow.timestamp),
+        timestampType: typeof dbRow.timestamp,
+        videoTimestamp: dbRow.video_timestamp,
+        senderId: dbRow.sender_id,
+        content: dbRow.content
+      });
+    }
   }
 
   public async addToQueue(item: Omit<QueueItem, 'id' | 'addedBy' | 'avatar'>): Promise<void> {
@@ -715,11 +914,16 @@ export class SupabaseRealtimeService implements RealtimeService {
         updatedAt: Date.now()
       };
 
+      const chatHistory = await this.fetchChatHistory(session.roomId);
+
       setTimeout(() => {
         if (this.listeners.onRoomUpdate) this.listeners.onRoomUpdate(room);
         if (this.listeners.onParticipantsChange) this.listeners.onParticipantsChange(participants);
         if (this.listeners.onPlaybackChange) this.listeners.onPlaybackChange(playback);
         if (this.listeners.onQueueChange) this.listeners.onQueueChange(queue);
+        chatHistory.forEach(msg => {
+          if (this.listeners.onChatMessage) this.listeners.onChatMessage(msg);
+        });
       }, 200);
 
       return { room, participantId: session.participantId };
@@ -734,6 +938,10 @@ export class SupabaseRealtimeService implements RealtimeService {
   private async subscribeToRoom(roomId: string) {
     const sb = this.checkSupabase();
     this.unsubscribe();
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
 
     this.channel = sb.channel(`cineroom_${roomId}`);
 
@@ -763,6 +971,14 @@ export class SupabaseRealtimeService implements RealtimeService {
       .on('postgres_changes', { event: '*', schema: 'public', table: 'playback_states', filter: `room_id=eq.${roomId}` }, (payload) => {
         if (payload.new && this.listeners.onPlaybackChange) {
           const p = payload.new as any;
+          console.log("[VIDEO_DEBUG][REALTIME_RECEIVED]", p);
+          if (p.source_type !== 'local') {
+            console.log("[VIDEO_DEBUG][URL][REALTIME_RECEIVED]", {
+              sourceUrl: p.source_url,
+              sourceType: p.source_type,
+              eventId: p.event_id
+            });
+          }
           this.listeners.onPlaybackChange({
             sourceType: p.source_type,
             sourceUrl: p.source_url || '',
@@ -788,15 +1004,45 @@ export class SupabaseRealtimeService implements RealtimeService {
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'chat_messages', filter: `room_id=eq.${roomId}` }, (payload) => {
         if (payload.new && this.listeners.onChatMessage) {
           const c = payload.new as any;
+          const parsedTs = this.parseTimestamp(c.timestamp);
+          
+          const getChatDebugInfo = (ts: any) => {
+            const tsNum = Number(ts);
+            const date = new Date(tsNum);
+            const iso = isNaN(date.getTime()) ? 'Invalid Date' : date.toISOString();
+            const formatted = isNaN(date.getTime()) ? 'Invalid Date' : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+            return {
+              timestamp: ts,
+              typeofTimestamp: typeof ts,
+              isoRepresentation: iso,
+              formattedLocalTime: formatted
+            };
+          };
+
+          console.log("[CHAT_DEBUG][REALTIME]", {
+            messageId: c.id,
+            ...getChatDebugInfo(c.timestamp)
+          });
+
+          console.log("[CHAT_TRACE]", {
+            stage: 'realtime_received',
+            messageId: c.id,
+            timestamp: Number(c.timestamp),
+            timestampType: typeof c.timestamp,
+            videoTimestamp: c.video_timestamp,
+            senderId: c.sender_id,
+            content: c.content
+          });
           this.listeners.onChatMessage({
             id: c.id,
             senderId: c.sender_id,
             senderName: c.sender_name,
             senderAvatar: c.sender_avatar,
             content: c.content,
-            timestamp: Number(c.timestamp),
+            timestamp: parsedTs,
             videoTimestamp: c.video_timestamp,
-            isSystem: c.is_system
+            isSystem: c.is_system,
+            replyToId: c.reply_to_id
           });
         }
       })
@@ -808,9 +1054,9 @@ export class SupabaseRealtimeService implements RealtimeService {
           }
         }
       })
-      .on('broadcast', { event: 'signaling' }, async (payload) => {
+      .on('broadcast', { event: 'signaling' }, (payload) => {
         const { targetId, senderId, type, data } = payload.payload;
-        if (targetId === this.localParticipantId && await this.isParticipantActive(senderId)) {
+        if (targetId === '*' || targetId === this.localParticipantId) {
           if (this.listeners.onSignalingMessage) {
             this.listeners.onSignalingMessage({ senderId, type, payload: data });
           }
@@ -837,19 +1083,54 @@ export class SupabaseRealtimeService implements RealtimeService {
       });
 
     this.channel.subscribe(async (status) => {
+      logger.info(`[REALTIME] Subscription status switched to: ${status}`);
       if (status === 'SUBSCRIBED') {
         logger.info('Subscribed to Supabase Realtime channel.');
+        this.reconnectAttempt = 0; // Reset counter on successful subscribe
         await this.channel!.track({
           id: this.localParticipantId,
           nickname: this.localNickname,
           avatar: this.localAvatar,
           onlineAt: new Date().toISOString()
         });
+      } else if (status === 'CHANNEL_ERROR') {
+        logger.error('[REALTIME] CHANNEL_ERROR received.');
+        this.handleRealtimeReconnect(roomId);
+      } else if (status === 'TIMED_OUT') {
+        logger.info('[REALTIME] TIMED_OUT received.');
+        this.handleRealtimeReconnect(roomId);
+      } else if (status === 'CLOSED') {
+        logger.info('[REALTIME] CLOSED received.');
       }
     });
   }
 
+  private handleRealtimeReconnect(roomId: string) {
+    if (this.reconnectTimer) return; // Reconnect is already scheduled
+
+    this.reconnectAttempt++;
+    const delay = Math.min(10000, Math.pow(2, this.reconnectAttempt) * 1000);
+    logger.info(`[REALTIME] Attempting channel resubscription in ${(delay / 1000).toFixed(1)}s (Attempt #${this.reconnectAttempt})...`);
+
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      if (this.activeRoomId === roomId) {
+        try {
+          await this.subscribeToRoom(roomId);
+        } catch (e: any) {
+          logger.error(`[REALTIME] Resubscription attempt failed:`, e.message);
+          this.handleRealtimeReconnect(roomId);
+        }
+      }
+    }, delay);
+  }
+
   private unsubscribe() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.reconnectAttempt = 0;
     if (this.channel) {
       this.channel.unsubscribe();
       this.channel = null;

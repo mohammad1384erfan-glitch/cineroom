@@ -60,4 +60,14 @@ export interface WebRTCService {
    * Clear all active hooks.
    */
   clearListeners(): void;
+
+  /**
+   * Checks if a peer connection exists for the given peer ID.
+   */
+  hasPeerConnection(peerId: string): boolean;
+
+  /**
+   * Returns the readyState of the DataChannel for the given peer ID, or null if it doesn't exist.
+   */
+  getDataChannelState(peerId: string): string | null;
 }

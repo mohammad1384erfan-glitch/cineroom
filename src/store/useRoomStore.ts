@@ -11,7 +11,9 @@ import {
   UserPermissions,
   realtimeService,
   webrtcService,
-  logger
+  logger,
+  logLocalFileE2E,
+  logLocalTransfer
 } from '@/services';
 
 export interface SessionStats {
@@ -49,6 +51,7 @@ interface RoomState {
   p2pActiveFileId: string | null;
   p2pSubtitleName: string | null;
   p2pSubtitleUrl: string | null;
+  lastP2PUrlUpdateTime: number | null;
 
   // Premium stats tracking
   sessionStats: SessionStats;
@@ -72,7 +75,7 @@ interface RoomState {
   leaveRoom: () => Promise<void>;
   restoreSession: () => Promise<boolean>;
   updatePlayback: (state: Partial<PlaybackState>) => Promise<void>;
-  sendChatMessage: (content: string) => Promise<void>;
+  sendChatMessage: (content: string, replyToId?: string | null) => Promise<void>;
   addToQueue: (title: string, url: string, sourceType: 'url' | 'local') => Promise<void>;
   removeFromQueue: (itemId: string) => Promise<void>;
   reorderQueue: (queue: QueueItem[]) => Promise<void>;
@@ -154,6 +157,7 @@ export const useRoomStore = create<RoomState>((set, get) => {
     p2pActiveFileId: null,
     p2pSubtitleName: null,
     p2pSubtitleUrl: null,
+    lastP2PUrlUpdateTime: null,
 
     // Premium stats tracking
     isWatchPartyFinished: false,
@@ -301,9 +305,9 @@ export const useRoomStore = create<RoomState>((set, get) => {
       }
     },
 
-    sendChatMessage: async (content) => {
+    sendChatMessage: async (content, replyToId) => {
       try {
-        await realtimeService.sendChatMessage(content);
+        await realtimeService.sendChatMessage(content, replyToId);
       } catch (err: any) {
         logger.error('Failed to send chat message:', err.message);
         set({ error: err.message });
@@ -363,11 +367,28 @@ export const useRoomStore = create<RoomState>((set, get) => {
             p2pActiveFileId: null,
             p2pProgress: 0,
             p2pReceivedBytes: 0,
+            p2pBufferedChunks: new Map(),
             p2pObjectUrl: null,
-            isP2PBuffering: false
+            isP2PBuffering: false,
+            lastP2PUrlUpdateTime: null
           });
           return;
         }
+
+        logLocalFileE2E('[HOST][FILE_SELECTED]');
+        logLocalFileE2E('[HOST][FILE_METADATA]');
+
+        console.log("[LOCAL_E2E][HOST][FILE_SELECTED]", {
+          name: file.name,
+          size: file.size,
+          type: file.type
+        });
+
+        console.log("[VIDEO_DEBUG][HOST][FILE_SELECTED]", {
+          fileName: file.name,
+          fileSize: file.size,
+          fileType: file.type
+        });
 
         // Generate fileId
         const fileId = 'f-' + Math.random().toString(36).substring(2, 8);
@@ -382,6 +403,21 @@ export const useRoomStore = create<RoomState>((set, get) => {
           playing: false,
           currentTime: 0,
           videoId: fileId
+        });
+
+        logLocalFileE2E('[HOST][SOURCE_PUBLISHED]');
+
+        console.log("[LOCAL_E2E][HOST][SOURCE_PUBLISHED]", {
+          roomId: get().room?.id || 'unknown',
+          hostId: get().participantId,
+          fileName: file.name,
+          fileSize: file.size
+        });
+
+        console.log("[VIDEO_DEBUG][HOST][SOURCE_PUBLISHED]", {
+          videoId: fileId,
+          fileName: file.name,
+          fileSize: file.size
         });
 
         // Initialize local Host P2P state
@@ -580,7 +616,10 @@ export const useRoomStore = create<RoomState>((set, get) => {
             if (p.id !== selfId && p.isConnected) {
               const peerExists = get().webrtcPeers.some((peer) => peer.peerId === p.id);
               if (!peerExists) {
-                webrtcService.connectToPeer(p.id, p.name);
+                // Prevent WebRTC glare/collision by having only the lexicographically smaller ID initiate the connection
+                if (selfId && selfId < p.id) {
+                  webrtcService.connectToPeer(p.id, p.name);
+                }
               }
             }
           });
@@ -594,6 +633,23 @@ export const useRoomStore = create<RoomState>((set, get) => {
         },
 
         onPlaybackChange: (playbackState) => {
+          console.log("[VIDEO_DEBUG][STATE_APPLIED]", {
+            sourceType: playbackState.sourceType,
+            sourceUrl: playbackState.sourceUrl,
+            videoId: playbackState.videoId,
+            currentTime: playbackState.currentTime,
+            playing: playbackState.playing,
+            stateVersion: playbackState.stateVersion,
+            eventId: playbackState.eventId
+          });
+          console.log("[PLAYBACK_TRACE]", {
+            event_id: playbackState.eventId,
+            state_version: playbackState.stateVersion,
+            playing: playbackState.playing,
+            current_time: playbackState.currentTime,
+            source_url: playbackState.sourceUrl,
+            source_type: playbackState.sourceType
+          });
           set({ playbackState });
 
           if (!playbackState.fileName) {
@@ -607,7 +663,8 @@ export const useRoomStore = create<RoomState>((set, get) => {
               p2pReceivedBytes: 0,
               p2pBufferedChunks: new Map(),
               p2pObjectUrl: null,
-              isP2PBuffering: false
+              isP2PBuffering: false,
+              lastP2PUrlUpdateTime: null
             });
             return;
           }
@@ -619,28 +676,104 @@ export const useRoomStore = create<RoomState>((set, get) => {
           const fileId = playbackState.videoId;
 
           if (isLocal && !isSelfHost && fileId) {
+            logLocalFileE2E('[GUEST][SOURCE_RECEIVED]');
+            logLocalTransfer('[GUEST][SOURCE_RECEIVED]');
+            if (hostId) {
+              logLocalFileE2E('[GUEST][HOST_ID_RESOLVED]');
+              logLocalTransfer('[GUEST][HOST_RESOLVED]');
+            }
+
+            console.log("[LOCAL_E2E][GUEST][SOURCE_RECEIVED]", {
+              roomId: get().room?.id || 'unknown',
+              hostId,
+              guestId: selfId,
+              fileName: playbackState.fileName,
+              fileSize: playbackState.fileSize,
+              MIMEtype: playbackState.fileName?.endsWith('.webm') ? 'video/webm' : 'video/mp4'
+            });
+            console.log("[LOCAL_E2E][GUEST][HOST_ID]", {
+              hostId
+            });
+
+            const peerConnectionExists = webrtcService.hasPeerConnection(hostId || '');
+            if (peerConnectionExists) {
+              logLocalFileE2E('[GUEST][PEER_FOUND]');
+              logLocalTransfer('[GUEST][PEER_FOUND]');
+            }
+
+            const pc = (webrtcService as any).pcs?.get(hostId || '');
+            console.log("[LOCAL_E2E][GUEST][PEER_CONNECTION]", {
+              connectionState: pc ? pc.connectionState : 'none',
+              iceConnectionState: pc ? pc.iceConnectionState : 'none'
+            });
+
+            const dataChannelState = webrtcService.getDataChannelState(hostId || '');
+            if (dataChannelState) {
+              logLocalFileE2E('[GUEST][DATA_CHANNEL_STATE]');
+              logLocalTransfer('[GUEST][CHANNEL_FOUND]');
+              logLocalTransfer('[GUEST][CHANNEL_STATE]');
+            }
+
+            console.log("[LOCAL_E2E][GUEST][DATA_CHANNEL_STATE]", {
+              readyState: dataChannelState || 'not_found'
+            });
+
+            console.log("[VIDEO_DEBUG][LOCAL][GUEST_SOURCE_RECEIVED]");
+            console.log("[VIDEO_DEBUG][LOCAL][GUEST_HOST_LOOKUP]", {
+              hostId,
+              participantId: selfId,
+              peerConnectionExists,
+              dataChannelExists: dataChannelState !== null
+            });
+            console.log("[VIDEO_DEBUG][LOCAL][GUEST_DATA_CHANNEL]", {
+              readyState: dataChannelState || 'not_found'
+            });
+
             const currentFileId = get().p2pActiveFileId;
             if (currentFileId !== fileId) {
-              // New P2P streaming file: Reset buffer and request from chunk 0
+              console.log("[VIDEO_DEBUG][GUEST][SOURCE_RECEIVED]", {
+                fileName: playbackState.fileName,
+                fileSize: playbackState.fileSize,
+                videoId: fileId
+              });
+              console.log("[VIDEO_DEBUG][GUEST][HOST_ID]", {
+                hostId,
+                localParticipantId: selfId
+              });
+              console.log("[VIDEO_TRACE][GUEST] SOURCE_EVENT", {
+                fileName: playbackState.fileName,
+                fileSize: playbackState.fileSize,
+                videoId: fileId,
+                hostId
+              });
+              // New P2P streaming file: Reset buffer and request initial chunk batch
               set({
                 p2pActiveFileId: fileId,
                 p2pProgress: 0,
                 p2pReceivedBytes: 0,
                 p2pBufferedChunks: new Map(),
                 p2pObjectUrl: null,
-                isP2PBuffering: true
+                isP2PBuffering: true,
+                lastP2PUrlUpdateTime: null
               });
               webrtcService.requestFileChunk(fileId, 0);
+              const totalChunks = Math.ceil((playbackState.fileSize || 65536) / 65536);
+              const batchCount = Math.min(4, totalChunks);
+              for (let i = 1; i < batchCount; i++) {
+                webrtcService.requestFileChunk(fileId, i);
+              }
             } else {
-              // Resuming transfer: Locate the next missing index
+              // Resuming transfer: Locate missing indices and request next batch
               const buffers = get().p2pBufferedChunks;
               let nextIndex = 0;
               while (buffers.has(nextIndex)) {
                 nextIndex++;
               }
-              const total = Math.ceil(playbackState.fileSize / 65536);
-              if (nextIndex < total) {
-                webrtcService.requestFileChunk(fileId, nextIndex);
+              const total = Math.ceil((playbackState.fileSize || 65536) / 65536);
+              for (let i = 0; i < 4 && nextIndex + i < total; i++) {
+                if (!buffers.has(nextIndex + i)) {
+                  webrtcService.requestFileChunk(fileId, nextIndex + i);
+                }
               }
             }
           }
@@ -652,12 +785,53 @@ export const useRoomStore = create<RoomState>((set, get) => {
             return;
           }
 
+          const getChatDebugInfo = (ts: any) => {
+            const tsNum = Number(ts);
+            const date = new Date(tsNum);
+            const iso = isNaN(date.getTime()) ? 'Invalid Date' : date.toISOString();
+            const formatted = isNaN(date.getTime()) ? 'Invalid Date' : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+            return {
+              timestamp: ts,
+              typeofTimestamp: typeof ts,
+              isoRepresentation: iso,
+              formattedLocalTime: formatted
+            };
+          };
+
+          console.log("[CHAT_DEBUG][STORE]", {
+            messageId: chatMsg.id,
+            ...getChatDebugInfo(chatMsg.timestamp)
+          });
+
+          console.log("[CHAT_TRACE]", {
+            stage: 'zustand_store',
+            messageId: chatMsg.id,
+            timestamp: chatMsg.timestamp,
+            timestampType: typeof chatMsg.timestamp,
+            videoTimestamp: chatMsg.videoTimestamp,
+            senderId: chatMsg.senderId,
+            content: chatMsg.content
+          });
+
           set((state) => {
             const activity = { ...state.sessionStats.activityCount };
             activity[chatMsg.senderId] = (activity[chatMsg.senderId] || 0) + 1;
 
+            let updatedMessages = [...state.chatMessages, chatMsg].slice(-100);
+            
+            // Map and resolve replyToMessage references dynamically
+            updatedMessages = updatedMessages.map(msg => {
+              if (msg.replyToId && !msg.replyToMessage) {
+                const original = updatedMessages.find(m => m.id === msg.replyToId);
+                if (original) {
+                  return { ...msg, replyToMessage: original };
+                }
+              }
+              return msg;
+            });
+
             return {
-              chatMessages: [...state.chatMessages, chatMsg].slice(-100),
+              chatMessages: updatedMessages,
               sessionStats: {
                 ...state.sessionStats,
                 totalMessages: state.sessionStats.totalMessages + 1,
@@ -753,41 +927,106 @@ export const useRoomStore = create<RoomState>((set, get) => {
             buffers.set(chunkIndex, buffer);
 
             let p2pObjectUrl = state.p2pObjectUrl;
-            // 4% metadata buffer chunk count threshold before playback starts
-            const initialBufferLimit = Math.max(1, Math.min(totalChunks, Math.round(totalChunks * 0.04)));
-            const hasInitialBuffer = buffers.size >= initialBufferLimit;
+            const prevProgress = Math.round((state.p2pBufferedChunks.size / totalChunks) * 100);
+            const progress = Math.round((buffers.size / totalChunks) * 100);
 
-            if (hasInitialBuffer) {
-              const parts: ArrayBuffer[] = [];
-              for (let i = 0; i <= chunkIndex; i++) {
-                if (buffers.has(i)) {
-                  parts.push(buffers.get(i)!);
-                } else {
-                  break; // stop on missing chunks
+            const progressChanged = progress !== prevProgress;
+            const now = Date.now();
+
+            const shouldRecreateUrl = buffers.size === totalChunks && progressChanged;
+
+            let lastP2PUrlUpdateTime = state.lastP2PUrlUpdateTime;
+
+            if (shouldRecreateUrl) {
+              let totalReceivedBytes = 0;
+              buffers.forEach((buf) => {
+                totalReceivedBytes += buf.byteLength;
+              });
+
+              const expectedChunkCount = totalChunks;
+              const chunkCount = buffers.size;
+              const originalFileSize = state.playbackState.fileSize || 0;
+              const receivedByteCount = totalReceivedBytes;
+
+              // Calculate missing chunks count
+              let missingChunkCount = 0;
+              const missingIndices: number[] = [];
+              for (let i = 0; i < expectedChunkCount; i++) {
+                if (!buffers.has(i)) {
+                  missingChunkCount++;
+                  missingIndices.push(i);
                 }
               }
 
-              if (parts.length > 0) {
-                const blob = new Blob(parts, { type: 'video/mp4' });
+              let fileType = 'video/mp4';
+              const fileName = state.playbackState.fileName?.toLowerCase() || '';
+              if (fileName.endsWith('.webm') || fileName.endsWith('.mkv')) {
+                fileType = 'video/webm';
+              } else if (fileName.endsWith('.ogg') || fileName.endsWith('.ogv')) {
+                fileType = 'video/ogg';
+              } else if (fileName.endsWith('.mov')) {
+                fileType = 'video/mp4';
+              }
+
+              // Integrity check logs
+              console.log("[LOCAL_FILE_E2E][GUEST][INTEGRITY_CHECK]", {
+                originalFileSize,
+                receivedByteCount,
+                chunkCount,
+                missingChunkCount,
+                expectedChunkCount,
+                mimeType: fileType
+              });
+
+              const isIntegrityValid = missingChunkCount === 0 && receivedByteCount > 0;
+
+              if (!isIntegrityValid) {
+                console.error("[LOCAL_FILE_E2E][GUEST][INTEGRITY_FAILED]", {
+                  originalFileSize,
+                  receivedByteCount,
+                  missingChunkCount,
+                  missingChunks: missingIndices
+                });
+              } else {
+                const parts: ArrayBuffer[] = [];
+                for (let i = 0; i < totalChunks; i++) {
+                  parts.push(buffers.get(i)!);
+                }
+
+                const blob = new Blob(parts, { type: fileType });
                 if (p2pObjectUrl) {
                   URL.revokeObjectURL(p2pObjectUrl);
                 }
                 p2pObjectUrl = URL.createObjectURL(blob);
+                lastP2PUrlUpdateTime = now;
+
+                logLocalFileE2E('[GUEST][BLOB_CREATED]', {
+                  bytesReceived: blob.size,
+                  totalBytes: blob.size
+                });
+
+                logLocalFileE2E('[GUEST][OBJECT_URL_CREATED]');
+                logLocalFileE2E('[GUEST][VIDEO_SRC_ASSIGNED]');
               }
             }
 
-            const isBuffering = buffers.size < totalChunks && !buffers.has(chunkIndex + 1);
+            const isBuffering = buffers.size < totalChunks;
 
             return {
               p2pBufferedChunks: buffers,
               p2pObjectUrl,
-              isP2PBuffering: isBuffering
+              isP2PBuffering: isBuffering,
+              lastP2PUrlUpdateTime
             };
           });
 
-          // Self-regulating backpressure pull-loop
-          if (chunkIndex < totalChunks - 1) {
-            webrtcService.requestFileChunk(fileId, chunkIndex + 1);
+          // Pipelined chunk requests (request ahead up to 4 missing chunks)
+          const windowAhead = 4;
+          for (let w = 1; w <= windowAhead; w++) {
+            const nextIdx = chunkIndex + w;
+            if (nextIdx < totalChunks) {
+              webrtcService.requestFileChunk(fileId, nextIdx);
+            }
           }
         }
       });

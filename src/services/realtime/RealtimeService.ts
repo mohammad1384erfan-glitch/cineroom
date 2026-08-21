@@ -44,7 +44,7 @@ export interface RealtimeService {
   /**
    * Broadcast a validated/sanitized chat message to peers.
    */
-  sendChatMessage(content: string): Promise<void>;
+  sendChatMessage(content: string, replyToId?: string | null): Promise<void>;
 
   /**
    * Add a new direct/local video item to the synchronized queue.

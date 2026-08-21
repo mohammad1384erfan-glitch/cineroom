@@ -4,7 +4,7 @@ import {
   Film, Copy, Check, LogOut, Play, Pause, 
   Terminal, Users, FolderOpen, Send, 
   Crown, Wifi, Mic, MicOff, Plus, Trash2, ArrowUp, ArrowDown, Minimize2, Maximize2,
-  Lock, Unlock, MessageSquare, PlaySquare, Shield, RefreshCw, Smile, AlertTriangle
+  Lock, Unlock, MessageSquare, PlaySquare, Shield, RefreshCw, Smile, AlertTriangle, X
 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
@@ -12,7 +12,12 @@ import { Badge } from '@/components/ui/Badge';
 import { Modal } from '@/components/ui/Modal';
 import { BottomSheet } from '@/components/ui/BottomSheet';
 import { useRoomStore } from '@/store/useRoomStore';
-import { logger, QueueItem, Participant, UserPermissions, ChatMessage, webrtcService } from '@/services';
+import { 
+  logger, QueueItem, Participant, UserPermissions, ChatMessage, webrtcService,
+  VideoSourceType, VideoSourceResolver, VideoPlayerAdapter, PlayerCapabilities,
+  NativeVideoAdapter, HLSVideoAdapter, YouTubeAdapter, VimeoAdapter, DailymotionAdapter,
+  AparatAdapter, GenericEmbedAdapter
+} from '@/services';
 
 const REACTION_EMOJIS = ['❤️', '😂', '😮', '😢', '😡', '🔥'];
 const COUPLE_EMOJIS = ['❤️', '🫂', '😘', '😂'];
@@ -102,71 +107,6 @@ const convertSrtToVtt = (srtContent: string): string => {
   return vtt;
 };
 
-const getAparatVideoId = (url: string): string | null => {
-  try {
-    const parsed = new URL(url);
-    if (parsed.hostname.includes('aparat.com')) {
-      const match = parsed.pathname.match(/\/v\/([a-zA-Z0-9]+)/);
-      if (match) return match[1];
-    }
-  } catch (_) {}
-  return null;
-};
-
-const validateVideoUrl = (url: string): Promise<void> => {
-  return new Promise((resolve, reject) => {
-    try {
-      new URL(url);
-    } catch (_) {
-      return reject(new Error('Invalid URL format. Please enter a valid web URL.'));
-    }
-
-    const tempVideo = document.createElement('video');
-    tempVideo.preload = 'metadata';
-    tempVideo.src = url;
-    
-    const timer = setTimeout(() => {
-      tempVideo.src = '';
-      tempVideo.load();
-      reject(new Error('Connection timed out. The video server did not respond.'));
-    }, 6000);
-
-    tempVideo.onloadedmetadata = () => {
-      clearTimeout(timer);
-      tempVideo.src = '';
-      tempVideo.load();
-      resolve();
-    };
-
-    tempVideo.onerror = () => {
-      clearTimeout(timer);
-      tempVideo.src = '';
-      tempVideo.load();
-      const err = tempVideo.error;
-      const isDirectMedia = /\.(mp4|webm|ogg|ogv|mov|m4v|m3u8|mpd)($|\?)/i.test(url);
-      
-      if (err) {
-        if (err.code === 1) reject(new Error('Video loading aborted.'));
-        else if (err.code === 2) reject(new Error('Network error: Unable to download video.'));
-        else if (err.code === 3) reject(new Error('Decode error: The video codec or container is not supported by your browser.'));
-        else if (err.code === 4) {
-          if (!isDirectMedia) {
-            reject(new Error('The URL you entered is not a direct video stream. If this is a platform video (like Aparat), please load it via the Supported Platforms tab. Otherwise, make sure to enter a direct URL ending in .mp4 or .webm.'));
-          } else {
-            reject(new Error('Format error: The video is not playable. This is usually due to CORS restrictions or an invalid MIME type.'));
-          }
-        }
-        else reject(new Error('Failed to load video source. Please verify the URL and CORS permissions.'));
-      } else {
-        if (!isDirectMedia) {
-          reject(new Error('The URL you entered is not a direct video stream. If this is a platform video (like Aparat), please load it via the Supported Platforms tab. Otherwise, make sure to enter a direct URL ending in .mp4 or .webm.'));
-        } else {
-          reject(new Error('Failed to load video. This URL may require authentication or have CORS block.'));
-        }
-      }
-    };
-  });
-};
 
 export const Room: React.FC = () => {
   const navigate = useNavigate();
@@ -194,9 +134,9 @@ export const Room: React.FC = () => {
   const [directUrl, setDirectUrl] = useState('');
   const [videoTitle, setVideoTitle] = useState('');
   const [chatInput, setChatInput] = useState('');
+  const [replyTarget, setReplyTarget] = useState<ChatMessage | null>(null);
   const [showChangeVideoForm, setShowChangeVideoForm] = useState(false);
   const [activeLoaderTab, setActiveLoaderTab] = useState<'local' | 'url' | 'platforms'>('url');
-  const [aparatUrl, setAparatUrl] = useState('');
   const [activeTab, setActiveTab] = useState<'chat' | 'members' | 'queue'>('chat');
   const [isCinemaMode, setIsCinemaMode] = useState(false);
   const [showPermissionsModal, setShowPermissionsModal] = useState(false);
@@ -208,15 +148,71 @@ export const Room: React.FC = () => {
   const [videoDuration, setVideoDuration] = useState(0);
   const [driftDuration, setDriftDuration] = useState(0);
   const [isMovieFinished, setIsMovieFinished] = useState(false);
+  const [resolutionStatus, setResolutionStatus] = useState('');
+  const [playbackError, setPlaybackError] = useState<string | null>(null);
 
   useEffect(() => {
     setIsMovieFinished(false);
-  }, [store.playbackState.sourceUrl]);
+    setPlaybackError(null);
+  }, [store.playbackState.sourceUrl, store.playbackState.sourceType]);
 
   // Mobile Sheet States
   const [isMobileChatOpen, setIsMobileChatOpen] = useState(false);
   const [isMobileMembersOpen, setIsMobileMembersOpen] = useState(false);
   const [isMobileQueueOpen, setIsMobileQueueOpen] = useState(false);
+
+  // Unread messages notification badge state and effects
+  const [unreadChatCount, setUnreadChatCount] = useState(0);
+  const isChatActive = (!isCinemaMode && activeTab === 'chat') || isMobileChatOpen;
+  const lastMessagesLengthRef = useRef(store.chatMessages.length);
+
+  useEffect(() => {
+    if (isChatActive) {
+      setUnreadChatCount(0);
+    } else {
+      const prevLength = lastMessagesLengthRef.current;
+      const newMessages = store.chatMessages.slice(prevLength);
+      
+      // Filter out messages sent by the local participant and system alerts
+      const incomingUnread = newMessages.filter(
+        (msg) => msg.senderId !== store.participantId && !msg.isSystem
+      );
+
+      if (incomingUnread.length > 0) {
+        setUnreadChatCount((prev) => {
+          const newCount = prev + incomingUnread.length;
+          console.log("[UNREAD_TRACE]", {
+            isChatActive: false,
+            senderId: incomingUnread[incomingUnread.length - 1].senderId,
+            localParticipantId: store.participantId,
+            previousCount: prev,
+            newCount: newCount,
+            badgeVisible: newCount > 0
+          });
+          return newCount;
+        });
+      }
+    }
+    lastMessagesLengthRef.current = store.chatMessages.length;
+  }, [store.chatMessages, isChatActive, store.participantId]);
+
+  useEffect(() => {
+    if (isChatActive) {
+      setUnreadChatCount((prev) => {
+        if (prev > 0) {
+          console.log("[UNREAD_TRACE]", {
+            isChatActive: true,
+            senderId: 'N/A',
+            localParticipantId: store.participantId,
+            previousCount: prev,
+            newCount: 0,
+            badgeVisible: false
+          });
+        }
+        return 0;
+      });
+    }
+  }, [isChatActive, store.participantId]);
 
   // Sticker Picker and URL Loading States
   const [isStickerPickerOpen, setIsStickerPickerOpen] = useState(false);
@@ -260,10 +256,21 @@ export const Room: React.FC = () => {
   // References
   const logsEndRef = useRef<HTMLDivElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
-  const videoElementRef = useRef<HTMLVideoElement>(null);
+  const playerContainerRef = useRef<HTMLDivElement>(null);
+  const adapterRef = useRef<VideoPlayerAdapter | null>(null);
+  const [capabilities, setCapabilities] = useState<PlayerCapabilities | null>(null);
   
   // Lock flag prevents infinite loop on programmatic plays/pauses/seeks
   const isRespondingToSync = useRef(false);
+
+  useEffect(() => {
+    (window as any).store = useRoomStore;
+    (window as any).VideoSourceResolver = VideoSourceResolver;
+    return () => {
+      delete (window as any).store;
+      delete (window as any).VideoSourceResolver;
+    };
+  }, []);
 
   // Verification checks & Room state guards
   useEffect(() => {
@@ -287,9 +294,11 @@ export const Room: React.FC = () => {
         const isHost = store.room?.hostId === store.participantId;
         if (isHost || self?.permissions.canPlayPause) {
           const currentPlaying = store.playbackState.isPlaying;
+          const currentT = adapterRef.current?.getCurrentTime() || store.playbackState.currentTime;
           store.updatePlayback({
+            playing: !currentPlaying,
             isPlaying: !currentPlaying,
-            currentTime: videoElementRef.current?.currentTime || store.playbackState.currentTime
+            currentTime: currentT
           });
           logger.info(`Shortcut: Toggled playback state via [Space]`);
         }
@@ -314,116 +323,184 @@ export const Room: React.FC = () => {
     };
   }, [store.room, store.participantId, store.participants, store.playbackState]);
 
-  // Handle programmatic playhead sync updates arriving from store events
-  useEffect(() => {
-    const video = videoElementRef.current;
-    if (!video) return;
+  // Dynamic Player Adapter Instantiation & Lifecycle Management
+  const activeSourceUrl = store.playbackState.sourceUrl;
+  const activeSourceType = store.playbackState.sourceType;
 
-    // Programmatic play/pause sync
-    isRespondingToSync.current = true;
-    if (store.playbackState.playing) {
-      if (video.paused) {
-        video.play().catch((err) => {
-          logger.error('Playback: Programmatic play blocked by autoplay guard.', err);
-        });
+  const createAdapter = (type: VideoSourceType): VideoPlayerAdapter => {
+    switch (type) {
+      case 'local':
+      case 'url':
+        return new NativeVideoAdapter();
+      case 'hls':
+        return new HLSVideoAdapter();
+      case 'youtube':
+        return new YouTubeAdapter();
+      case 'vimeo':
+        return new VimeoAdapter();
+      case 'dailymotion':
+        return new DailymotionAdapter();
+      case 'aparat':
+        return new AparatAdapter();
+      case 'embed':
+        return new GenericEmbedAdapter();
+      default:
+        return new NativeVideoAdapter();
+    }
+  };
+
+  useEffect(() => {
+    if (!activeSourceUrl && store.playbackState.sourceType !== 'local') {
+      if (adapterRef.current) {
+        adapterRef.current.destroy();
+        adapterRef.current = null;
       }
-    } else {
-      if (!video.paused) {
-        video.pause();
-      }
+      setCapabilities(null);
+      return;
     }
 
-    // Programmatic seek snaps (medium drift corrections or source change restarts)
-    const drift = Math.abs(video.currentTime - store.playbackState.currentTime);
-    if (drift > 2.2) {
-      isRespondingToSync.current = true;
-      video.currentTime = store.playbackState.currentTime;
-      setLocalCurrentTime(store.playbackState.currentTime);
-      logger.realtime(`Playback: programmatic snap applied. Drift of ${drift.toFixed(1)}s corrected.`);
+    if (store.playbackState.sourceType === 'local' && !store.p2pObjectUrl) {
+      return;
     }
-  }, [store.playbackState.playing, store.playbackState.currentTime, store.playbackState.videoId]);
 
-  // Periodic Playback Drift Detection & Correction Loop (every 1.5 seconds)
-  useEffect(() => {
-    const video = videoElementRef.current;
-    if (!video || !store.playbackState.fileName) return;
+    const container = playerContainerRef.current;
+    if (!container) return;
 
-    const checkDrift = () => {
-      // Calculate target room playhead position based on canonical offset
-      let targetTime = store.playbackState.currentTime;
+    const adapter = createAdapter(activeSourceType);
+
+    const isGuest = store.room?.hostId !== store.participantId;
+    if (activeSourceType !== 'local' && isGuest) {
+      console.log("[VIDEO_DEBUG][URL][GUEST_LOAD]");
+    }
+    
+    if (adapterRef.current) {
+      adapterRef.current.destroy();
+    }
+    container.innerHTML = '';
+    
+    adapterRef.current = adapter;
+    setCapabilities(adapter.capabilities);
+
+    adapter.onStateChange = (state) => {
+      if (state.duration !== undefined) {
+        setVideoDuration(state.duration);
+      }
+      if (state.currentTime !== undefined) {
+        setLocalCurrentTime(state.currentTime);
+      }
+
+      const canPlayPause = isHost || selfParticipant?.permissions.canPlayPause;
+      const canSeek = isHost || selfParticipant?.permissions.canSeek;
+
+      // Guest Play/Pause violation check
+      if (state.playing !== undefined && state.playing !== store.playbackState.playing) {
+        if (isHost) {
+          store.updatePlayback({ playing: state.playing, currentTime: adapter.getCurrentTime() });
+        } else {
+          if (!canPlayPause) {
+            if (store.playbackState.playing) {
+              adapter.play();
+            } else {
+              adapter.pause();
+            }
+          } else {
+            store.updatePlayback({ playing: state.playing, currentTime: adapter.getCurrentTime() });
+          }
+        }
+      }
+
+      // Guest Seek violation check
+      if (state.currentTime !== undefined) {
+        const drift = Math.abs(state.currentTime - store.playbackState.currentTime);
+        if (drift > 2.5 && !isHost) {
+          if (!canSeek) {
+            adapter.seek(store.playbackState.currentTime);
+          } else {
+            store.updatePlayback({ currentTime: state.currentTime });
+          }
+        }
+      }
+    };
+
+    adapter.onEnded = () => {
+      setIsMovieFinished(true);
+    };
+
+    adapter.onError = (err) => {
+      setPlaybackError(err.message || 'Failed to load video stream. The URL server may have CORS or hotlink restrictions.');
+    };
+
+    adapter.load(container).then(() => {
       if (store.playbackState.playing) {
-        const elapsed = (Date.now() - store.playbackState.lastUpdateTimestamp) / 1000;
-        targetTime += elapsed;
-      }
-
-      // Hard cap target to video duration
-      if (video.duration) {
-        targetTime = Math.min(targetTime, video.duration);
-      }
-
-      const drift = video.currentTime - targetTime;
-      const absDrift = Math.abs(drift);
-
-      if (absDrift < 0.35) {
-        // Safe lock zone: restore standard playback speed
-        if (video.playbackRate !== 1.0) {
-          video.playbackRate = 1.0;
-        }
-        setDriftDuration(0);
-      } else if (absDrift >= 0.35 && absDrift < 2.5) {
-        // Small drift: smoothly adjust speed to catch up or wait
-        if (drift < 0) {
-          video.playbackRate = 1.06; // behind: speed up
-        } else {
-          video.playbackRate = 0.94; // ahead: slow down
-        }
-        setDriftDuration(0);
-      } else if (absDrift >= 2.5 && absDrift < 6.0) {
-        // Medium drift: perform programmatic hard snap
-        isRespondingToSync.current = true;
-        video.currentTime = targetTime;
-        setLocalCurrentTime(targetTime);
-        video.playbackRate = 1.0;
-        setDriftDuration(0);
-        logger.realtime(`Drift: Snapping playhead. Out-of-sync gap of ${Math.abs(drift).toFixed(1)}s snapped.`);
+        adapter.play();
       } else {
-        // Large drift (>= 6 seconds)
-        if (drift < 0) {
-          // User is behind (e.g. paused or buffering): trigger warning banner
-          setDriftDuration(Math.round(Math.abs(drift)));
-        } else {
-          // Guest is ahead of target: snap back immediately
-          isRespondingToSync.current = true;
-          video.currentTime = targetTime;
-          setLocalCurrentTime(targetTime);
-          video.playbackRate = 1.0;
-          setDriftDuration(0);
-        }
+        adapter.pause();
+      }
+      adapter.seek(store.playbackState.currentTime);
+    });
+
+    return () => {
+      adapter.destroy();
+      if (adapterRef.current === adapter) {
+        adapterRef.current = null;
       }
     };
+  }, [activeSourceUrl, activeSourceType, !store.p2pObjectUrl]);
 
-    const interval = setInterval(checkDrift, 1500);
-    return () => {
-      clearInterval(interval);
-      if (video) video.playbackRate = 1.0;
-    };
-  }, [store.playbackState]);
-
-  // Host-Only Periodic Playhead Sync Broadcasts (every 5 seconds)
+  // Update local P2P video source on-the-fly as chunks buffer
   useEffect(() => {
-    const video = videoElementRef.current;
-    if (!video || store.room?.hostId !== store.participantId) return;
+    const adapter = adapterRef.current;
+    if (store.playbackState.sourceType === 'local' && store.p2pObjectUrl && adapter) {
+      if (adapter.updateSource) {
+        adapter.updateSource(store.p2pObjectUrl);
+      }
+    }
+  }, [store.p2pObjectUrl, store.playbackState.sourceType]);
+
+  // Realtime Sync from Store to Adapter
+  useEffect(() => {
+    const adapter = adapterRef.current;
+    if (!adapter || !adapter.capabilities.realtimeSync) return;
+
+    isRespondingToSync.current = true;
+
+    if (store.playbackState.playing) {
+      adapter.play();
+    } else {
+      adapter.pause();
+    }
+
+    let targetTime = store.playbackState.currentTime;
+    if (store.playbackState.playing) {
+      const elapsed = (Date.now() - store.playbackState.lastUpdateTimestamp) / 1000;
+      targetTime += elapsed;
+    }
+
+    const localTime = adapter.getCurrentTime();
+    const drift = Math.abs(localTime - targetTime);
+
+    if (drift > 2.5) {
+      adapter.seek(targetTime);
+      setLocalCurrentTime(targetTime);
+      logger.realtime(`Drift sync: programmatically aligned playhead. Drift: ${drift.toFixed(1)}s`);
+    }
+  }, [store.playbackState.playing, store.playbackState.currentTime, store.playbackState.videoId, store.playbackState.eventId]);
+
+  // Host broadcast periodic updates
+  useEffect(() => {
+    const adapter = adapterRef.current;
+    if (!adapter || store.room?.hostId !== store.participantId || !adapter.capabilities.realtimeSync) return;
 
     const interval = setInterval(() => {
-      if (video && !video.paused) {
+      if (adapter && store.playbackState.playing) {
         store.updatePlayback({
-          currentTime: video.currentTime
+          currentTime: adapter.getCurrentTime()
         });
       }
     }, 5000);
 
     return () => clearInterval(interval);
-  }, [store.room, store.participantId]);
+  }, [store.room, store.participantId, store.playbackState.playing]);
 
   // Scroll watchers
   useEffect(() => {
@@ -469,94 +546,66 @@ export const Room: React.FC = () => {
         alert(err.message);
       }
     }
-  };  const handleLoadUrlVideo = async (e: React.FormEvent) => {
+  };
+
+  const handleLoadUrlVideo = async (e: React.FormEvent) => {
     e.preventDefault();
     const url = directUrl.trim();
     if (!url) return;
 
     setIsUrlLoading(true);
+    setResolutionStatus('Resolving video source...');
 
     try {
-      const aparatId = getAparatVideoId(url);
-      if (aparatId) {
-        await store.updatePlayback({
-          sourceType: 'aparat',
-          sourceUrl: url,
-          fileName: `Aparat Video (${aparatId})`,
-          fileSize: 0,
-          isPlaying: false,
-          playing: false,
-          currentTime: 0,
-          videoId: aparatId
-        });
-        setDirectUrl('');
-        setVideoTitle('');
-      } else {
-        const title = videoTitle.trim() || url.split('/').pop() || 'Direct Video Stream';
-        await validateVideoUrl(url);
-        await store.updatePlayback({
-          sourceType: 'url',
-          sourceUrl: url,
-          fileName: title,
-          fileSize: 0,
-          isPlaying: false,
-          playing: false,
-          currentTime: 0,
-          videoId: url
-        });
-        setDirectUrl('');
-        setVideoTitle('');
-      }
-    } catch (err: any) {
-      alert(err.message);
-    } finally {
-      setIsUrlLoading(false);
-    }
-  };
+      const resolved = await VideoSourceResolver.resolveSource(url);
+      
+      const typeLabels: Record<string, string> = {
+        url: 'Direct Video Stream',
+        hls: 'HLS Playlist (.m3u8)',
+        youtube: 'YouTube Platform Player',
+        vimeo: 'Vimeo Platform Player',
+        dailymotion: 'Dailymotion Platform Player',
+        aparat: 'Aparat Platform Player',
+        embed: 'Embedded Movie Player'
+      };
+      
+      setResolutionStatus(`Detected: ${typeLabels[resolved.type] || resolved.type}`);
+      
+      setTimeout(() => {
+        setResolutionStatus('Loading video...');
+      }, 800);
 
-  const handleLoadAparatVideo = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const url = aparatUrl.trim();
-    if (!url) return;
+      const finalTitle = videoTitle.trim() || resolved.fileName;
 
-    const aparatId = getAparatVideoId(url);
-    if (!aparatId) {
-      alert('Unsupported platform URL. Please enter a valid Aparat video URL (e.g., https://www.aparat.com/v/yjn9e79).');
-      return;
-    }
+      // Small visual delay so user sees resolution steps
+      await new Promise(resolve => setTimeout(resolve, 1400));
 
-    setIsUrlLoading(true);
-    try {
       await store.updatePlayback({
-        sourceType: 'aparat',
-        sourceUrl: url,
-        fileName: `Aparat Video (${aparatId})`,
+        sourceType: resolved.type,
+        sourceUrl: resolved.resolvedUrl,
+        fileName: finalTitle,
         fileSize: 0,
         isPlaying: false,
         playing: false,
         currentTime: 0,
-        videoId: aparatId
+        videoId: resolved.videoId
       });
-      setAparatUrl('');
+
+      setDirectUrl('');
+      setVideoTitle('');
     } catch (err: any) {
       alert(err.message);
     } finally {
       setIsUrlLoading(false);
+      setResolutionStatus('');
     }
   };
+
+
 
   const handleLocalFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-
-    const ext = file.name.split('.').pop()?.toLowerCase();
-    const mimeType = file.type;
-
-    if (ext === 'mkv' || mimeType.includes('matroska')) {
-      alert(`Warning: .MKV is a container format that is generally not natively supported by web browsers. Only MKV files containing browser-supported codecs (like H.264 video and AAC/MP3 audio) can be played, but many will fail to render video or audio. For optimal compatibility, please use web-native MP4 (H.264/AAC).`);
-    } else if (mimeType && !document.createElement('video').canPlayType(mimeType)) {
-      alert(`Warning: The format of "${file.name}" (${mimeType}) may not be natively supported by your browser. If playback fails, please use a standard MP4 file.`);
-    }
 
     // Clear subtitle if changing video
     if (store.p2pSubtitleName) {
@@ -653,8 +702,8 @@ export const Room: React.FC = () => {
   };
 
   const handleTogglePlay = () => {
-    const video = videoElementRef.current;
-    if (!video) return;
+    const adapter = adapterRef.current;
+    if (!adapter) return;
 
     if (!isHost && !selfParticipant?.permissions.canPlayPause) {
       alert('You do not have permission to play/pause.');
@@ -662,153 +711,50 @@ export const Room: React.FC = () => {
     }
 
     const nextPlaying = !store.playbackState.playing;
+    if (nextPlaying) {
+      adapter.play();
+    } else {
+      adapter.pause();
+    }
     store.updatePlayback({
       playing: nextPlaying,
       isPlaying: nextPlaying,
-      currentTime: video.currentTime
+      currentTime: adapter.getCurrentTime()
     });
   };
 
   const handleSeekChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const time = parseFloat(e.target.value);
     setLocalCurrentTime(time);
-    const video = videoElementRef.current;
-    if (video) {
+    const adapter = adapterRef.current;
+    if (adapter) {
       isRespondingToSync.current = true;
-      video.currentTime = time;
+      adapter.seek(time);
     }
   };
 
   const handleSeekEnd = () => {
-    const video = videoElementRef.current;
-    if (!video) return;
+    const adapter = adapterRef.current;
+    if (!adapter) return;
 
     if (!isHost && !selfParticipant?.permissions.canSeek) {
       isRespondingToSync.current = true;
-      video.currentTime = store.playbackState.currentTime;
+      adapter.seek(store.playbackState.currentTime);
       setLocalCurrentTime(store.playbackState.currentTime);
       alert('You do not have permission to seek.');
       return;
     }
 
     store.updatePlayback({
-      currentTime: video.currentTime
-    });
-  };
-
-  const handleTimeUpdate = () => {
-    const video = videoElementRef.current;
-    if (video) {
-      setLocalCurrentTime(video.currentTime);
-    }
-  };
-
-  const handleDurationChange = () => {
-    const video = videoElementRef.current;
-    if (video) {
-      setVideoDuration(video.duration);
-    }
-  };
-
-  const handleLocalPlay = () => {
-    if (isRespondingToSync.current) {
-      isRespondingToSync.current = false;
-      return;
-    }
-
-    const video = videoElementRef.current;
-    if (!video) return;
-
-    // Safety Pause Rule Block
-    const hasReconnecting = store.participants.some(p => p.connectionStatus === 'reconnecting');
-    if (hasReconnecting) {
-      isRespondingToSync.current = true;
-      video.pause();
-      logger.error('Playback blocked: A participant is reconnecting.');
-      return;
-    }
-
-    if (!isHost && !selfParticipant?.permissions.canPlayPause) {
-      isRespondingToSync.current = true;
-      video.pause();
-      logger.error('Playback: Play event blocked due to missing permissions.');
-      return;
-    }
-
-    store.updatePlayback({
-      playing: true,
-      isPlaying: true,
-      currentTime: video.currentTime
-    });
-  };
-
-  const handleLocalPause = () => {
-    if (isRespondingToSync.current) {
-      isRespondingToSync.current = false;
-      return;
-    }
-
-    const video = videoElementRef.current;
-    if (!video) return;
-
-    // Safety Pause Rule Block
-    const hasReconnecting = store.participants.some(p => p.connectionStatus === 'reconnecting');
-    if (hasReconnecting) {
-      isRespondingToSync.current = true;
-      video.pause();
-      return;
-    }
-
-    if (!isHost && !selfParticipant?.permissions.canPlayPause) {
-      isRespondingToSync.current = true;
-      video.play().catch(() => {});
-      logger.error('Playback: Pause event blocked due to missing permissions.');
-      return;
-    }
-
-    store.updatePlayback({
-      playing: false,
-      isPlaying: false,
-      currentTime: video.currentTime
-    });
-  };
-
-  const handleLocalSeeked = () => {
-    if (isRespondingToSync.current) {
-      isRespondingToSync.current = false;
-      return;
-    }
-
-    const video = videoElementRef.current;
-    if (!video) return;
-
-    // Safety Pause Rule Block
-    const hasReconnecting = store.participants.some(p => p.connectionStatus === 'reconnecting');
-    if (hasReconnecting) {
-      isRespondingToSync.current = true;
-      video.currentTime = store.playbackState.currentTime;
-      setLocalCurrentTime(store.playbackState.currentTime);
-      return;
-    }
-
-    if (!isHost && !selfParticipant?.permissions.canSeek) {
-      isRespondingToSync.current = true;
-      video.currentTime = store.playbackState.currentTime;
-      setLocalCurrentTime(store.playbackState.currentTime);
-      logger.error('Playback: Seek event blocked due to missing permissions.');
-      return;
-    }
-
-    store.updatePlayback({
-      currentTime: video.currentTime
+      currentTime: adapter.getCurrentTime()
     });
   };
 
   const handleForceSync = () => {
-    const video = videoElementRef.current;
-    if (video) {
+    const adapter = adapterRef.current;
+    if (adapter) {
       store.updatePlayback({
-        currentTime: video.currentTime
+        currentTime: adapter.getCurrentTime()
       });
       logger.info('Host triggered playback sync command on all nodes.');
     }
@@ -816,7 +762,7 @@ export const Room: React.FC = () => {
 
   const handleVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const vol = parseFloat(e.target.value);
-    const video = videoElementRef.current;
+    const video = playerContainerRef.current?.querySelector('video');
     if (video) {
       video.volume = vol;
     }
@@ -825,11 +771,24 @@ export const Room: React.FC = () => {
   const handleSendChat = (e: React.FormEvent) => {
     e.preventDefault();
     if (!chatInput.trim()) return;
-    store.sendChatMessage(chatInput).then(() => {
+    store.sendChatMessage(chatInput, replyTarget?.id).then(() => {
       setChatInput('');
+      setReplyTarget(null);
     }).catch(err => {
       alert(err.message);
     });
+  };
+
+  const handleQuoteClick = (targetId: string) => {
+    const el = document.getElementById(`chat-msg-${targetId}`);
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      // Apply temporary visual highlight
+      el.classList.add('bg-brand-primary/10', 'ring-1', 'ring-brand-primary/40', 'rounded-lg', 'transition-all', 'duration-300');
+      setTimeout(() => {
+        el.classList.remove('bg-brand-primary/10', 'ring-1', 'ring-brand-primary/40', 'rounded-lg');
+      }, 1500);
+    }
   };
 
   // Queue helper moves item to active player and removes it from queue list
@@ -888,16 +847,16 @@ export const Room: React.FC = () => {
   const loadSampleVideo = async (url: string, title: string) => {
     setIsUrlLoading(true);
     try {
-      await validateVideoUrl(url);
+      const resolved = await VideoSourceResolver.resolveSource(url);
       await store.updatePlayback({
-        sourceType: 'url',
-        sourceUrl: url,
-        fileName: title,
+        sourceType: resolved.type,
+        sourceUrl: resolved.resolvedUrl,
+        fileName: title || resolved.fileName,
         fileSize: 0,
         isPlaying: false,
         playing: false,
         currentTime: 0,
-        videoId: url
+        videoId: resolved.videoId
       });
     } catch (err: any) {
       alert(err.message);
@@ -1077,16 +1036,17 @@ export const Room: React.FC = () => {
                   variant="primary" 
                   size="sm" 
                   onClick={() => {
-                    const video = videoElementRef.current;
-                    if (video) {
+                    const adapter = adapterRef.current;
+                    if (adapter) {
                       let targetTime = store.playbackState.currentTime;
                       if (store.playbackState.playing) {
                         const elapsed = (Date.now() - store.playbackState.lastUpdateTimestamp) / 1000;
                         targetTime += elapsed;
-                        if (video.duration) targetTime = Math.min(targetTime, video.duration);
+                        const duration = adapter.getDuration();
+                        if (duration) targetTime = Math.min(targetTime, duration);
                       }
                       isRespondingToSync.current = true;
-                      video.currentTime = targetTime;
+                      adapter.seek(targetTime);
                       setLocalCurrentTime(targetTime);
                       setDriftDuration(0);
                       logger.info('Synced playhead to room target.');
@@ -1117,120 +1077,8 @@ export const Room: React.FC = () => {
             {store.playbackState.fileName ? (
               // Video element exists
               <div className="w-full h-full relative group bg-black">
-                {store.playbackState.sourceType === 'aparat' ? (
-                  <iframe
-                    src={`https://www.aparat.com/video/video/embed/videohash/${store.playbackState.videoId}/vt/frame`}
-                    className="w-full h-full border-0 bg-zinc-950"
-                    allowFullScreen
-                    allow="autoplay; encrypted-media"
-                  />
-                ) : store.playbackState.sourceType === 'url' || store.playbackState.sourceType === 'local' ? (
-                  <>
-                    <video 
-                      ref={videoElementRef}
-                      key={(store.playbackState.sourceType === 'local' ? store.p2pObjectUrl || '' : store.playbackState.sourceUrl) + (store.p2pSubtitleUrl || '')}
-                      className="w-full h-full object-contain"
-                      controls={false}
-                      onPlay={handleLocalPlay}
-                      onPause={handleLocalPause}
-                      onSeeked={handleLocalSeeked}
-                      onTimeUpdate={handleTimeUpdate}
-                      onDurationChange={handleDurationChange}
-                      onEnded={() => setIsMovieFinished(true)}
-                    >
-                      <source 
-                        src={store.playbackState.sourceType === 'local' ? store.p2pObjectUrl || '' : store.playbackState.sourceUrl} 
-                        type="video/mp4" 
-                      />
-                      {store.p2pSubtitleUrl && (
-                        <track 
-                          kind="subtitles" 
-                          src={store.p2pSubtitleUrl} 
-                          srcLang="en" 
-                          label={store.p2pSubtitleName || 'Subtitles'} 
-                          default 
-                        />
-                      )}
-                    </video>
-
-                    {isMovieFinished && (
-                      <div className="absolute inset-0 z-40 bg-zinc-950/95 flex flex-col items-center justify-center gap-4 select-none animate-fade-in">
-                        <div className="w-16 h-16 rounded-full bg-brand-primary/10 border border-brand-primary/30 flex items-center justify-center text-brand-primary animate-pulse">
-                          <Film size={26} />
-                        </div>
-                        <div className="text-center">
-                          <span className="text-xs text-brand-primary font-extrabold uppercase tracking-widest">
-                            🎬 Movie Finished
-                          </span>
-                          {store.queue.length > 0 ? (
-                            <div className="mt-3 flex flex-col items-center gap-2.5">
-                              <span className="text-[10px] text-zinc-500 font-bold uppercase tracking-wider block">
-                                Next Up
-                              </span>
-                              <span className="text-sm font-bold text-white block max-w-xs truncate px-4">
-                                {store.queue[0].title}
-                              </span>
-                              {isHost ? (
-                                <Button 
-                                  variant="primary" 
-                                  size="sm" 
-                                  onClick={() => {
-                                    const nextItem = store.queue[0];
-                                    handlePlayQueueItem(nextItem);
-                                    setIsMovieFinished(false);
-                                  }}
-                                  className="mt-2 text-[10px] uppercase font-bold tracking-widest px-6"
-                                >
-                                  Start Next Video
-                                </Button>
-                              ) : (
-                                <span className="text-[10px] text-zinc-500 italic block mt-1 animate-pulse">
-                                  Waiting for Host to start next video...
-                                </span>
-                              )}
-                            </div>
-                          ) : (
-                            <p className="text-[10px] text-zinc-500 mt-2">
-                              The watch queue is empty. Load another video source to continue.
-                            </p>
-                          )}
-                        </div>
-                      </div>
-                    )}
-                    {/* Buffering warning overlay */}
-                    {store.playbackState.sourceType === 'local' && store.isP2PBuffering && !isMovieFinished && (
-                      <div className="absolute inset-0 z-25 bg-black/60 flex flex-col items-center justify-center gap-2 select-none animate-fade-in pointer-events-none">
-                        <div className="w-10 h-10 rounded-full bg-black/50 flex items-center justify-center text-brand-primary">
-                          <RefreshCw size={18} className="animate-spin text-brand-primary" />
-                        </div>
-                        <span className="text-[10px] text-zinc-300 font-extrabold uppercase tracking-wider bg-black/75 px-3 py-1 rounded border border-glass">
-                          Buffering...
-                        </span>
-                      </div>
-                    )}
-
-                    {/* Streaming status badge */}
-                    {store.playbackState.sourceType === 'local' && (
-                      <div className="absolute top-4 left-4 z-20 select-none flex flex-col gap-1.5 pointer-events-none">
-                        <div className="flex items-center gap-1.5 bg-black/75 px-2.5 py-1 rounded border border-glass">
-                          <span className="w-1.5 h-1.5 rounded-full bg-brand-primary animate-pulse" />
-                          <span className="text-[9px] text-zinc-300 uppercase font-extrabold tracking-wider">
-                            {isHost ? 'Streaming local video' : 'Receiving video...'}
-                          </span>
-                        </div>
-                        {!isHost && store.p2pProgress < 100 && (
-                          <div className="bg-black/75 px-2.5 py-1 rounded border border-glass flex flex-col gap-1">
-                            <span className="text-[8px] text-zinc-400 font-bold uppercase tracking-wider block">
-                              Buffer Progress: {store.p2pProgress}%
-                            </span>
-                            <div className="w-24 h-1 bg-zinc-800 rounded-full overflow-hidden">
-                              <div className="h-full bg-brand-primary" style={{ width: `${store.p2pProgress}%` }} />
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </>
+                {store.playbackState.sourceType !== 'local' || store.p2pObjectUrl ? (
+                  <div className="w-full h-full" ref={playerContainerRef} />
                 ) : (
                   // Waiting for P2P buffer to build initial segments
                   <div className="w-full h-full flex flex-col items-center justify-center bg-zinc-950 p-6 text-center select-none gap-4">
@@ -1253,6 +1101,126 @@ export const Room: React.FC = () => {
                       <span className="text-[9px] text-zinc-500 font-bold font-mono">
                         {store.p2pProgress}% ({(store.p2pReceivedBytes / (1024 * 1024)).toFixed(1)} MB / {(store.playbackState.fileSize / (1024 * 1024)).toFixed(1)} MB)
                       </span>
+                    </div>
+                  </div>
+                )}
+
+                {isMovieFinished && (
+                  <div className="absolute inset-0 z-40 bg-zinc-950/95 flex flex-col items-center justify-center gap-4 select-none animate-fade-in">
+                    <div className="w-16 h-16 rounded-full bg-brand-primary/10 border border-brand-primary/30 flex items-center justify-center text-brand-primary animate-pulse">
+                      <Film size={26} />
+                    </div>
+                    <div className="text-center">
+                      <span className="text-xs text-brand-primary font-extrabold uppercase tracking-widest">
+                        🎬 Movie Finished
+                      </span>
+                      {store.queue.length > 0 ? (
+                        <div className="mt-3 flex flex-col items-center gap-2.5">
+                          <span className="text-[10px] text-zinc-500 font-bold uppercase tracking-wider block">
+                            Next Up
+                          </span>
+                          <span className="text-sm font-bold text-white block max-w-xs truncate px-4">
+                            {store.queue[0].title}
+                          </span>
+                          {isHost ? (
+                            <Button 
+                              variant="primary" 
+                              size="sm" 
+                              onClick={() => {
+                                const nextItem = store.queue[0];
+                                handlePlayQueueItem(nextItem);
+                                setIsMovieFinished(false);
+                              }}
+                              className="mt-2 text-[10px] uppercase font-bold tracking-widest px-6"
+                            >
+                              Start Next Video
+                            </Button>
+                          ) : (
+                            <span className="text-[10px] text-zinc-500 italic block mt-1 animate-pulse">
+                              Waiting for Host to start next video...
+                            </span>
+                          )}
+                        </div>
+                      ) : (
+                        <p className="text-[10px] text-zinc-500 mt-2">
+                          The watch queue is empty. Load another video source to continue.
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Buffering warning overlay */}
+                {store.playbackState.sourceType === 'local' && store.isP2PBuffering && !isMovieFinished && (
+                  <div className="absolute inset-0 z-25 bg-black/60 flex flex-col items-center justify-center gap-2 select-none animate-fade-in pointer-events-none">
+                    <div className="w-10 h-10 rounded-full bg-black/50 flex items-center justify-center text-brand-primary">
+                      <RefreshCw size={18} className="animate-spin text-brand-primary" />
+                    </div>
+                    <span className="text-[10px] text-zinc-300 font-extrabold uppercase tracking-wider bg-black/75 px-3 py-1 rounded border border-glass">
+                      Buffering...
+                    </span>
+                  </div>
+                )}
+
+                {/* Streaming status badge */}
+                {store.playbackState.sourceType === 'local' && (
+                  <div className="absolute top-4 left-4 z-20 select-none flex flex-col gap-1.5 pointer-events-none">
+                    <div className="flex items-center gap-1.5 bg-black/75 px-2.5 py-1 rounded border border-glass">
+                      <span className="w-1.5 h-1.5 rounded-full bg-brand-primary animate-pulse" />
+                      <span className="text-[9px] text-zinc-300 uppercase font-extrabold tracking-wider">
+                        {isHost ? 'Streaming local video' : 'Receiving video...'}
+                      </span>
+                    </div>
+                    {!isHost && store.p2pProgress < 100 && (
+                      <div className="bg-black/75 px-2.5 py-1 rounded border border-glass flex flex-col gap-1">
+                        <span className="text-[8px] text-zinc-400 font-bold uppercase tracking-wider block">
+                          Buffer Progress: {store.p2pProgress}%
+                        </span>
+                        <div className="w-24 h-1 bg-zinc-800 rounded-full overflow-hidden">
+                          <div className="h-full bg-brand-primary" style={{ width: `${store.p2pProgress}%` }} />
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Playback Error Overlay */}
+                {playbackError && !isMovieFinished && (
+                  <div className="absolute inset-0 z-30 bg-black/85 flex flex-col items-center justify-center p-6 text-center gap-3 animate-fade-in">
+                    <div className="w-11 h-11 rounded-full bg-red-500/20 text-red-400 flex items-center justify-center">
+                      <AlertTriangle size={22} />
+                    </div>
+                    <h4 className="text-white font-bold text-xs tracking-wide">Video Stream Unavailable or Restricted</h4>
+                    <p className="text-[11px] text-zinc-400 max-w-sm leading-relaxed">
+                      {playbackError}
+                    </p>
+                    <div className="flex flex-wrap items-center justify-center gap-2 mt-1">
+                      {store.playbackState.sourceType === 'url' && isHost && (
+                        <Button 
+                          variant="primary" 
+                          size="sm" 
+                          onClick={() => {
+                            setPlaybackError(null);
+                            store.updatePlayback({ sourceType: 'embed' });
+                          }}
+                          className="text-[10px]"
+                        >
+                          Try as Embedded Player
+                        </Button>
+                      )}
+                      {isHost && (
+                        <Button 
+                          variant="outline" 
+                          size="sm" 
+                          onClick={() => {
+                            setPlaybackError(null);
+                            setShowChangeVideoForm(true);
+                          }}
+                          className="text-[10px]"
+                        >
+                          Change Video Source
+                        </Button>
+                      )}
                     </div>
                   </div>
                 )}
@@ -1356,12 +1324,12 @@ export const Room: React.FC = () => {
           <Card className="p-4 bg-zinc-950/50 backdrop-blur-sm border border-glass">
             <div className="flex flex-col gap-4">
               
-              {/* Aparat warning banner */}
-              {store.playbackState.sourceType === 'aparat' && (
+              {/* Synchronization warning banner */}
+              {capabilities && !capabilities.realtimeSync && (
                 <div className="flex items-center gap-2.5 bg-yellow-500/10 border border-yellow-500/20 text-yellow-500 px-3 py-2.5 rounded-lg text-xs leading-normal select-none">
                   <AlertTriangle size={15} className="shrink-0 text-yellow-500" />
                   <span>
-                    <strong>Platform Embedded Video (Aparat):</strong> Play/pause/seek synchronization is limited for platform-embedded videos. Please use the control bar inside the video screen directly.
+                    <strong>Platform Embedded Video (Limited Sync):</strong> Play/pause/seek synchronization is limited for this platform source. Please use the controls inside the video screen directly.
                   </span>
                 </div>
               )}
@@ -1378,7 +1346,7 @@ export const Room: React.FC = () => {
                   onChange={handleSeekChange}
                   onMouseUp={handleSeekEnd}
                   onTouchEnd={handleSeekEnd}
-                  disabled={store.playbackState.sourceType === 'aparat' || (!isHost && !selfParticipant?.permissions.canSeek)}
+                  disabled={(capabilities && !capabilities.seek) || (!isHost && !selfParticipant?.permissions.canSeek)}
                   className="flex-1 h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-brand-primary focus:outline-none disabled:opacity-30 disabled:pointer-events-none"
                 />
                 <span className="text-[10px] text-zinc-500 font-bold font-mono">{formatTime(videoDuration)}</span>
@@ -1393,9 +1361,9 @@ export const Room: React.FC = () => {
                     variant={store.playbackState.playing ? 'outline' : 'primary'}
                     size="md" 
                     onClick={handleTogglePlay}
-                    disabled={store.playbackState.sourceType === 'aparat' || (!isHost && !selfParticipant?.permissions.canPlayPause)}
+                    disabled={(capabilities && !capabilities.play) || (!isHost && !selfParticipant?.permissions.canPlayPause)}
                     className="w-10 h-10 rounded-lg flex items-center justify-center p-0 disabled:opacity-30 disabled:pointer-events-none"
-                    title={store.playbackState.sourceType === 'aparat' ? 'Platform Embedded Player (Use player controls inside video)' : (store.playbackState.playing ? 'Pause' : 'Play')}
+                    title={capabilities && !capabilities.play ? 'Platform Embedded Player (Use player controls inside video)' : (store.playbackState.playing ? 'Pause' : 'Play')}
                   >
                     {store.playbackState.playing ? <Pause size={16} /> : <Play size={16} />}
                   </Button>
@@ -1441,9 +1409,9 @@ export const Room: React.FC = () => {
                       variant="outline" 
                       size="sm" 
                       onClick={() => {
-                        const video = videoElementRef.current;
-                        if (video) {
-                          video.currentTime = store.playbackState.currentTime;
+                        const adapter = adapterRef.current;
+                        if (adapter) {
+                          adapter.seek(store.playbackState.currentTime);
                           logger.info('Playback force synchronized manually by user.');
                         }
                       }}
@@ -1518,15 +1486,21 @@ export const Room: React.FC = () => {
                           )}
                         </div>
 
+                        {resolutionStatus && (
+                          <div className="text-[10px] text-brand-primary font-bold animate-pulse px-1 select-none">
+                            🚀 {resolutionStatus}
+                          </div>
+                        )}
+
                         {activeLoaderTab === 'url' && (
                           <form onSubmit={handleLoadUrlVideo} className="flex flex-wrap items-center gap-2 animate-fade-in">
                             <input 
                               type="url"
-                              placeholder={isUrlLoading ? "Verifying URL..." : "Load Direct HTTP URL (MP4/WebM)"}
+                              placeholder={resolutionStatus || (isUrlLoading ? "Verifying URL..." : "Video URL (MP4, WebM, MKV, MOV, TS, HLS, YouTube, Aparat, etc.)")}
                               value={directUrl}
                               onChange={(e) => setDirectUrl(e.target.value)}
                               disabled={isUrlLoading}
-                              className="px-3 py-1.5 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none w-56 text-brand-text-main disabled:opacity-50"
+                              className="px-3 py-1.5 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none w-72 text-brand-text-main disabled:opacity-50"
                             />
                             <input 
                               type="text"
@@ -1534,26 +1508,26 @@ export const Room: React.FC = () => {
                               value={videoTitle}
                               onChange={(e) => setVideoTitle(e.target.value)}
                               disabled={isUrlLoading}
-                              className="px-3 py-1.5 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none w-32 text-brand-text-main disabled:opacity-50"
+                              className="px-3 py-1.5 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none w-36 text-brand-text-main disabled:opacity-50"
                             />
                             <Button variant="secondary" size="sm" type="submit" isLoading={isUrlLoading}>
-                              Load
+                              Load Video
                             </Button>
                           </form>
                         )}
 
                         {activeLoaderTab === 'platforms' && (
-                          <form onSubmit={handleLoadAparatVideo} className="flex flex-wrap items-center gap-2 animate-fade-in">
+                          <form onSubmit={handleLoadUrlVideo} className="flex flex-wrap items-center gap-2 animate-fade-in">
                             <input 
                               type="url"
-                              placeholder="Aparat URL (https://www.aparat.com/v/yjn9e79)"
-                              value={aparatUrl}
-                              onChange={(e) => setAparatUrl(e.target.value)}
+                              placeholder={resolutionStatus || "Paste Aparat, YouTube, Vimeo, or Dailymotion URL"}
+                              value={directUrl}
+                              onChange={(e) => setDirectUrl(e.target.value)}
                               disabled={isUrlLoading}
-                              className="px-3 py-1.5 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none w-72 text-brand-text-main disabled:opacity-50"
+                              className="px-3 py-1.5 rounded-lg text-xs bg-brand-bg-input border border-glass focus:outline-none w-80 text-brand-text-main disabled:opacity-50"
                             />
                             <Button variant="secondary" size="sm" type="submit" isLoading={isUrlLoading}>
-                              Load Aparat Embed
+                              Load Stream
                             </Button>
                           </form>
                         )}
@@ -1562,16 +1536,16 @@ export const Room: React.FC = () => {
                           <div className="flex flex-wrap items-center gap-3 animate-fade-in">
                             <label className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-glass bg-brand-bg-card hover:bg-brand-bg-input text-xs cursor-pointer text-brand-text-muted hover:text-white transition-colors duration-200">
                               <FolderOpen size={13} />
-                              <span>Host Local File</span>
+                              <span>Host Local File (MP4, MKV, WebM, MOV, TS)</span>
                               <input 
                                 type="file" 
-                                accept="video/*" 
+                                accept="video/*,.mkv,.mp4,.webm,.mov,.avi,.ts,.ogv,.m4v" 
                                 onChange={handleLocalFileSelect}
                                 className="hidden" 
                               />
                             </label>
                             <span className="text-[9px] text-zinc-500 max-w-[280px] leading-normal block italic select-none">
-                              ⚠️ Local videos stream directly from the Host's device. Quality matches the Host's upload bandwidth and network stability.
+                              ⚡ Local videos stream progressively to all room participants via WebRTC.
                             </span>
                           </div>
                         )}
@@ -1619,9 +1593,14 @@ export const Room: React.FC = () => {
 
           {/* MOBILE TRAY ACCESS TRIGGERS */}
           <div className="flex lg:hidden gap-3 justify-center select-none">
-            <Button variant="outline" size="sm" className="flex-1 text-[11px]" onClick={() => setIsMobileChatOpen(true)}>
+            <Button variant="outline" size="sm" className="flex-1 text-[11px] relative" onClick={() => setIsMobileChatOpen(true)}>
               <MessageSquare size={13} className="mr-1.5 text-brand-primary" />
               Chat Feed
+              {unreadChatCount > 0 && (
+                <span className="absolute -top-2 -right-1 bg-red-500 text-white text-[8px] font-extrabold rounded-full px-1.5 py-0.5 animate-pulse min-w-[15px] text-center border border-zinc-950 shadow-md">
+                  {unreadChatCount}
+                </span>
+              )}
             </Button>
             <Button variant="outline" size="sm" className="flex-1 text-[11px]" onClick={() => setIsMobileMembersOpen(true)}>
               <Users size={13} className="mr-1.5 text-brand-accent" />
@@ -1643,13 +1622,18 @@ export const Room: React.FC = () => {
               <div className="grid grid-cols-3 border-b border-glass bg-black/25">
                 <button
                   onClick={() => setActiveTab('chat')}
-                  className={`py-3 text-[10px] font-extrabold uppercase tracking-wider transition-all duration-300 ${
+                  className={`py-3 text-[10px] font-extrabold uppercase tracking-wider transition-all duration-300 relative ${
                     activeTab === 'chat' 
                       ? 'border-b-2 border-brand-primary text-white bg-white/5' 
                       : 'text-zinc-500 hover:text-white'
                   }`}
                 >
-                  Chat
+                  <span>Chat</span>
+                  {unreadChatCount > 0 && (
+                    <span className="absolute top-2 right-4 bg-red-500 text-white text-[8px] font-extrabold rounded-full px-1.5 py-0.5 animate-pulse min-w-[15px] text-center select-none shadow-md">
+                      {unreadChatCount}
+                    </span>
+                  )}
                 </button>
                 <button
                   onClick={() => setActiveTab('members')}
@@ -1683,6 +1667,21 @@ export const Room: React.FC = () => {
               {/* Chat Input panel */}
               {activeTab === 'chat' && (
                 <div className="p-3 border-t border-glass bg-black/15">
+                  {replyTarget && (
+                    <div className="mb-2 p-2 bg-zinc-900/90 border border-brand-primary/30 rounded-lg flex items-center justify-between animate-fade-in select-none">
+                      <div className="flex flex-col text-[10px] text-zinc-400 overflow-hidden pr-2">
+                        <span className="font-bold text-brand-primary">Replying to {replyTarget.senderName}:</span>
+                        <span className="italic truncate">"{replyTarget.content.startsWith('[STICKER]:') ? '🎨 Sticker' : replyTarget.content}"</span>
+                      </div>
+                      <button 
+                        type="button"
+                        onClick={() => setReplyTarget(null)}
+                        className="text-zinc-500 hover:text-white shrink-0 p-0.5"
+                      >
+                        <X size={11} />
+                      </button>
+                    </div>
+                  )}
                   <form onSubmit={handleSendChat} className="flex gap-2 relative">
                     <input 
                       type="text" 
@@ -1815,6 +1814,21 @@ export const Room: React.FC = () => {
             {renderChatComponent()}
           </div>
           <div className="p-2 border-t border-glass bg-black/10 flex flex-col gap-2 relative">
+            {replyTarget && (
+              <div className="mb-1 p-2 bg-zinc-900/90 border border-brand-primary/30 rounded-lg flex items-center justify-between animate-fade-in select-none">
+                <div className="flex flex-col text-[10px] text-zinc-400 overflow-hidden pr-2">
+                  <span className="font-bold text-brand-primary">Replying to {replyTarget.senderName}:</span>
+                  <span className="italic truncate">"{replyTarget.content.startsWith('[STICKER]:') ? '🎨 Sticker' : replyTarget.content}"</span>
+                </div>
+                <button 
+                  type="button"
+                  onClick={() => setReplyTarget(null)}
+                  className="text-zinc-500 hover:text-white shrink-0 p-0.5"
+                >
+                  <X size={11} />
+                </button>
+              </div>
+            )}
             {isMobileStickerPickerOpen && (
               <div 
                 ref={mobileStickerPickerRef}
@@ -2283,10 +2297,10 @@ export const Room: React.FC = () => {
         alert('You do not have permission to seek.');
         return;
       }
-      const video = videoElementRef.current;
-      if (video) {
+      const adapter = adapterRef.current;
+      if (adapter) {
         isRespondingToSync.current = true;
-        video.currentTime = time;
+        adapter.seek(time);
         setLocalCurrentTime(time);
       }
       store.updatePlayback({ currentTime: time });
@@ -2318,6 +2332,8 @@ export const Room: React.FC = () => {
               isSelf={isSelf}
               onTimestampClick={handleTimestampClick}
               formatVideoTime={formatVideoTime}
+              onReplyClick={(m) => setReplyTarget(m)}
+              onQuoteClick={handleQuoteClick}
             />
           );
         })}
@@ -2534,12 +2550,16 @@ const ChatItem = React.memo(({
   msg, 
   isSelf, 
   onTimestampClick, 
-  formatVideoTime 
+  formatVideoTime,
+  onReplyClick,
+  onQuoteClick
 }: { 
   msg: ChatMessage; 
   isSelf: boolean; 
   onTimestampClick: (time: number) => void; 
   formatVideoTime: (secs: number) => string; 
+  onReplyClick: (msg: ChatMessage) => void;
+  onQuoteClick: (targetId: string) => void;
 }) => {
   if (msg.isSystem) {
     return (
@@ -2549,10 +2569,56 @@ const ChatItem = React.memo(({
     );
   }
 
+  const getChatDebugInfo = (ts: any) => {
+    const tsNum = Number(ts);
+    const date = new Date(tsNum);
+    const iso = isNaN(date.getTime()) ? 'Invalid Date' : date.toISOString();
+    const formatted = isNaN(date.getTime()) ? 'Invalid Date' : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+    return {
+      timestamp: ts,
+      typeofTimestamp: typeof ts,
+      isoRepresentation: iso,
+      formattedLocalTime: formatted
+    };
+  };
+
+  console.log("[CHAT_DEBUG][RENDER]", {
+    messageId: msg.id,
+    ...getChatDebugInfo(msg.timestamp)
+  });
+
+  console.log("[CHAT_TRACE]", {
+    stage: 'chat_item_render',
+    messageId: msg.id,
+    timestamp: msg.timestamp,
+    timestampType: typeof msg.timestamp,
+    videoTimestamp: msg.videoTimestamp,
+    senderId: msg.senderId,
+    content: msg.content
+  });
+
   const displayTimestamp = msg.videoTimestamp !== undefined ? formatVideoTime(msg.videoTimestamp) : null;
+
+  const formatClockTime = (ts: number) => {
+    if (!ts) return '';
+    const date = new Date(ts);
+    const h = date.getHours().toString().padStart(2, '0');
+    const m = date.getMinutes().toString().padStart(2, '0');
+    const formatted = `${h}:${m}`;
+
+    console.log("[CHAT_TIMESTAMP][DISPLAY]", {
+      raw: ts,
+      parsed: ts,
+      dateObject: date.toString(),
+      formatted
+    });
+
+    return formatted;
+  };
 
   return (
     <div 
+      id={`chat-msg-${msg.id}`}
       className={`flex gap-2 max-w-[85%] ${isSelf ? 'self-end flex-row-reverse' : 'self-start'}`}
     >
       <div className="w-7 h-7 rounded-full bg-zinc-900 border border-glass flex items-center justify-center text-sm shrink-0 select-none">
@@ -2560,17 +2626,46 @@ const ChatItem = React.memo(({
       </div>
       <div className="flex flex-col">
         <span className="text-[9px] text-zinc-500 font-bold mb-0.5 px-0.5 flex items-center gap-1.5 select-none">
+          <span>{msg.senderName}</span>
+          <span className="text-[8px] text-zinc-500 font-normal">
+            {formatClockTime(msg.timestamp)}
+          </span>
           {displayTimestamp && (
             <button 
               type="button"
               onClick={() => onTimestampClick(msg.videoTimestamp!)}
-              className="text-[9px] text-brand-primary font-mono font-bold hover:underline cursor-pointer bg-brand-primary/10 px-1 py-0.5 rounded"
+              className="text-[9px] text-brand-primary font-mono font-bold hover:underline cursor-pointer bg-brand-primary/10 px-1 py-0.5 rounded ml-1"
+              title="Seek video to message timestamp"
             >
-              {displayTimestamp}
+              🎬 {displayTimestamp}
             </button>
           )}
-          {msg.senderName}
+          <button
+            type="button"
+            onClick={() => onReplyClick(msg)}
+            className="text-[8px] text-zinc-500 hover:text-white font-medium hover:underline cursor-pointer ml-1.5 flex items-center gap-0.5"
+            title="Reply to message"
+          >
+            Reply
+          </button>
         </span>
+        
+        {msg.replyToId && (
+          <div 
+            onClick={() => msg.replyToId && onQuoteClick(msg.replyToId)}
+            className="mb-1 text-[9px] text-zinc-400 bg-zinc-900/60 border-l-2 border-brand-primary py-1 px-2 rounded-r cursor-pointer hover:bg-zinc-800/80 transition-all select-none max-w-[250px] overflow-hidden text-ellipsis whitespace-nowrap"
+          >
+            {msg.replyToMessage ? (
+              <>
+                <span className="font-bold text-brand-primary">↩ {msg.replyToMessage.senderName}:</span>{" "}
+                <span className="italic">"{msg.replyToMessage.content.startsWith('[STICKER]:') ? '🎨 Sticker' : msg.replyToMessage.content}"</span>
+              </>
+            ) : (
+              <span className="italic text-zinc-500 font-medium">Original message unavailable</span>
+            )}
+          </div>
+        )}
+
         {msg.content.startsWith('[STICKER]:') ? (
           <div className="text-5xl py-1 px-1 select-none transform hover:scale-110 transition-transform duration-150">
             {msg.content.substring(10)}
