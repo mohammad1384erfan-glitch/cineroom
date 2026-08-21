@@ -34,6 +34,15 @@ export class NativeVideoAdapter implements VideoPlayerAdapter {
     video.setAttribute('playsinline', 'true');
     video.setAttribute('webkit-playsinline', 'true');
     video.setAttribute('referrerpolicy', 'no-referrer');
+
+    const source = document.createElement('source');
+    source.src = sourceUrl;
+    if (sourceUrl.includes('.webm') || sourceUrl.includes('.mkv')) {
+      source.type = 'video/webm';
+    } else {
+      source.type = 'video/mp4';
+    }
+    video.appendChild(source);
     video.src = sourceUrl;
 
     if (store.p2pSubtitleUrl) {
@@ -219,7 +228,18 @@ export class NativeVideoAdapter implements VideoPlayerAdapter {
   }
 
   public play(): void {
-    this.videoEl?.play().catch(() => {});
+    if (this.videoEl) {
+      const playPromise = this.videoEl.play();
+      if (playPromise !== undefined) {
+        playPromise.catch((err) => {
+          if (err.name === 'NotAllowedError' && this.videoEl) {
+            // Autoplay policy on mobile: play muted first so video frames render immediately
+            this.videoEl.muted = true;
+            this.videoEl.play().catch(() => {});
+          }
+        });
+      }
+    }
   }
 
   public pause(): void {
