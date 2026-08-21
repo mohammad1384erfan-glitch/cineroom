@@ -451,23 +451,23 @@ export class SupabaseRealtimeService implements RealtimeService {
 
       const { data, error } = await sb.rpc('playback_change_video', payload);
       if (error) {
-        console.error("[VIDEO_PIPELINE]", {
-          stage: 'playback_change_video_rpc',
-          url: sourceUrl,
-          provider: sourceType,
-          sourceType: sourceType,
-          resolvedSource: { url: sourceUrl, type: sourceType, videoId },
-          rpc: 'playback_change_video',
-          payload,
-          error: {
-            message: error.message,
-            details: error.details,
-            hint: error.hint,
-            code: error.code
-          }
-        });
-        logger.error('Failed to change video via RPC:', error.message);
-        throw new Error(error.message);
+        console.warn("[VIDEO_PIPELINE] RPC failed, falling back to direct table update:", error.message);
+        const { error: fallbackErr } = await sb.from('playback_states').update({
+          source_type: sourceType,
+          source_url: sourceUrl,
+          file_name: fileName,
+          file_size: fileSize,
+          video_id: videoId,
+          is_playing: false,
+          playing: false,
+          current_time: 0,
+          last_update_timestamp: Date.now()
+        }).eq('room_id', roomId);
+
+        if (fallbackErr) {
+          logger.error('Failed to change video via RPC and fallback:', fallbackErr.message);
+          throw new Error(error.message || fallbackErr.message);
+        }
       }
 
       console.log("[VIDEO_DEBUG][RPC_SUCCESS]", {

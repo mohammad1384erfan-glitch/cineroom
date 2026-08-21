@@ -19,8 +19,6 @@ export class MockWebRTCService implements WebRTCService {
   private dataChannels: Map<string, RTCDataChannel> = new Map();
   private streamingFile: File | null = null;
   private activeSubtitle: { name: string; content: string } | null = null;
-  private activeReceiveFileId: string | null = null;
-  private pendingChunkHeader: { fileId: string; index: number; totalChunks: number; size: number } | null = null;
   private receivedChunkBuffers: Map<number, ArrayBuffer> = new Map();
   private queuedCandidates: Map<string, RTCIceCandidateInit[]> = new Map();
 
@@ -120,39 +118,30 @@ export class MockWebRTCService implements WebRTCService {
     const dataChannel = pc.createDataChannel('cineroom-p2p-media', { negotiated: true, id: 100 });
     dataChannel.binaryType = 'arraybuffer';
     this.dataChannels.set(peerId, dataChannel);
+    this.bindDataChannel(peerId, dataChannel);
 
+    // Also listen for incoming data channels (e.g. mobile or cross-browser renegotiation)
+    pc.ondatachannel = (event) => {
+      const ch = event.channel;
+      ch.binaryType = 'arraybuffer';
+      this.dataChannels.set(peerId, ch);
+      this.bindDataChannel(peerId, ch);
+    };
+  }
+
+  private bindDataChannel(peerId: string, dataChannel: RTCDataChannel) {
     dataChannel.onopen = () => {
       const state = useRoomStore.getState();
       const isHost = state.room?.hostId === state.participantId;
-      if (isHost) {
-        logLocalFileE2E('[HOST][DATA_CHANNEL]', { targetId: peerId });
-        console.log("[VIDEO_DEBUG][LOCAL][DATA_CHANNEL]", {
-          peerId,
-          readyState: dataChannel.readyState
-        });
-      } else {
-        logLocalFileE2E('[GUEST][DATA_CHANNEL_STATE]');
-        console.log("[VIDEO_DEBUG][LOCAL][GUEST_DATA_CHANNEL]", {
-          readyState: dataChannel.readyState
-        });
-      }
-      console.log("[VIDEO_TRACE][DATA_CHANNEL]", {
-        peerId,
-        label: 'cineroom-p2p-media',
-        readyState: dataChannel.readyState
-      });
       logger.webrtc(`DataChannel 'cineroom-p2p-media' opened with peer [${peerId}].`);
 
       if (!isHost && peerId === state.room?.hostId) {
-        const fileId = state.p2pActiveFileId;
+        const fileId = state.p2pActiveFileId || state.playbackState.videoId;
         if (fileId && state.p2pProgress < 100) {
-          // Find first missing chunk index
-          let firstMissing = 0;
-          while (state.p2pBufferedChunks.has(firstMissing)) {
-            firstMissing++;
+          // Request first 4 chunks
+          for (let i = 0; i < 4; i++) {
+            this.requestFileChunk(fileId, i);
           }
-          logLocalFileE2E('[GUEST][DATA_CHANNEL_OPEN_RETRY_TRIGGER]', { chunkIndex: firstMissing });
-          this.requestFileChunk(fileId, firstMissing);
         }
       }
       if (this.activeSubtitle) {
@@ -174,250 +163,90 @@ export class MockWebRTCService implements WebRTCService {
     };
   }
 
-  private handleDataChannelPacket(senderId: string, data: any) {
+  private async handleDataChannelPacket(senderId: string, data: any) {
     if (typeof data === 'string') {
-      // Text packet (JSON command or chunk header)
-      if (data.startsWith('HEADER:')) {
-        const parts = data.split(':');
-        const fileId = parts[1];
-        const index = parseInt(parts[2], 10);
-        const totalChunks = parseInt(parts[3], 10);
-        const size = parseInt(parts[4], 10);
-        this.pendingChunkHeader = { fileId, index, totalChunks, size };
-      } else {
-        try {
-          const msg = JSON.parse(data);
-          if (msg.type === 'REQUEST_CHUNK') {
-            const { fileId, index } = msg;
-            
-            const state = useRoomStore.getState();
-            const roomId = state.room?.id || 'unknown';
-            const participantId = state.participantId;
-            const fileSize = this.streamingFile ? this.streamingFile.size : 0;
+      try {
+        const msg = JSON.parse(data);
+        if (msg.type === 'REQUEST_CHUNK') {
+          const { index } = msg;
+          if (this.streamingFile) {
+            const file = this.streamingFile;
+            const totalChunks = Math.ceil(file.size / 65536);
+            if (index < 0 || index >= totalChunks) return;
 
-            logLocalFileE2E('[HOST][CHUNK_REQUEST_RECEIVED]', {
-              targetId: senderId,
-              chunkIndex: index
-            });
+            const start = index * 65536;
+            const end = Math.min(file.size, start + 65536);
+            const slice = file.slice(start, end);
 
-            console.log("[VIDEO_DEBUG][LOCAL][CHUNK_REQUEST]", {
-              requesterId: senderId,
-              chunkIndex: index,
-              start: index * 65536,
-              end: Math.min(fileSize, (index + 1) * 65536)
-            });
+            const rawBuffer = await slice.arrayBuffer();
+            const channel = this.dataChannels.get(senderId);
+            if (channel && channel.readyState === 'open') {
+              // Self-contained binary packet: [4 bytes Uint32 index][4 bytes Uint32 totalChunks][payload]
+              const packet = new Uint8Array(8 + rawBuffer.byteLength);
+              const dv = new DataView(packet.buffer);
+              dv.setUint32(0, index, true);
+              dv.setUint32(4, totalChunks, true);
+              packet.set(new Uint8Array(rawBuffer), 8);
 
-            console.log("[VIDEO_DEBUG][HOST][CHUNK_REQUEST]", {
-              roomId,
-              senderId,
-              targetId: participantId,
-              hostId: participantId,
-              participantId,
-              chunkIndex: index,
-              chunkSize: 65536,
-              fileSize
-            });
-
-            console.log("[VIDEO_TRACE][HOST] CHUNK_REQUEST_RECEIVED", {
-              senderId,
-              fileId,
-              index
-            });
-            if (this.streamingFile) {
-              const file = this.streamingFile;
-              const totalChunks = Math.ceil(file.size / 65536);
-              const start = index * 65536;
-              const end = Math.min(file.size, start + 65536);
-              const slice = file.slice(start, end);
-
-              logLocalFileE2E('[HOST][CHUNK_READ]', {
-                targetId: senderId,
-                chunkIndex: index
-              });
-
-              const reader = new FileReader();
-              reader.onload = () => {
-                const buffer = reader.result as ArrayBuffer;
-                const channel = this.dataChannels.get(senderId);
-                if (channel && channel.readyState === 'open') {
-                  // Backpressure control: pause if data queue > 1MB
-                  const sendChunk = () => {
-                    if (channel.bufferedAmount > 1024 * 1024) {
-                      setTimeout(sendChunk, 50); // backoff retry
-                      return;
-                    }
-                    logLocalFileE2E('[HOST][CHUNK_SENT]', {
-                      targetId: senderId,
-                      chunkIndex: index,
-                      bytesReceived: buffer.byteLength
-                    });
-                    console.log("[VIDEO_DEBUG][LOCAL][CHUNK_SENT]", {
-                      targetId: senderId,
-                      chunkIndex: index,
-                      bytesSent: buffer.byteLength
-                    });
-                    console.log("[VIDEO_DEBUG][HOST][CHUNK_SENT]", {
-                      roomId,
-                      senderId: participantId,
-                      targetId: senderId,
-                      hostId: participantId,
-                      participantId,
-                      chunkIndex: index,
-                      chunkSize: buffer.byteLength,
-                      fileSize
-                    });
-                    console.log("[VIDEO_TRACE][HOST] CHUNK_SENT", {
-                      recipientId: senderId,
-                      fileId,
-                      index,
-                      chunkSize: buffer.byteLength
-                    });
-                    channel.send(`HEADER:${fileId}:${index}:${totalChunks}:${buffer.byteLength}`);
-                    channel.send(buffer);
-                  };
-                  sendChunk();
+              const sendChunk = () => {
+                if (channel.bufferedAmount > 1024 * 1024) {
+                  setTimeout(sendChunk, 40);
+                  return;
                 }
+                channel.send(packet.buffer);
               };
-              reader.readAsArrayBuffer(slice);
-            }
-          } else if (msg.type === 'CUSTOM_DATA') {
-            if (this.listeners.onDataChannelReceived) {
-              this.listeners.onDataChannelReceived({
-                peerId: senderId,
-                label: msg.label,
-                message: msg.message
-              });
+              sendChunk();
             }
           }
-        } catch (e: any) {
-          logger.error('Failed to parse text command on P2P channel:', e.message);
-        }
-      }
-    } else {
-      // Binary packet (ArrayBuffer containing media chunk bytes)
-      const header = this.pendingChunkHeader;
-      this.pendingChunkHeader = null;
-
-      if (header) {
-        if (this.activeReceiveFileId !== header.fileId) {
-          this.activeReceiveFileId = header.fileId;
-          this.receivedChunkBuffers.clear();
-        }
-
-        const processBufferAndContinue = (arrayBuffer: ArrayBuffer) => {
-          const uint8Array = new Uint8Array(arrayBuffer);
-          this.receivedChunkBuffers.set(header.index, arrayBuffer);
-
-          let totalReceivedBytes = 0;
-          this.receivedChunkBuffers.forEach((buf) => {
-            totalReceivedBytes += buf.byteLength;
+        } else if (msg.type === 'CUSTOM_DATA') {
+          this.listeners.onDataChannelReceived?.({
+            peerId: senderId,
+            label: msg.label,
+            message: msg.message
           });
+        }
+      } catch (_) {}
+    } else {
+      // Binary packet: [4 bytes index][4 bytes totalChunks][chunk data]
+      try {
+        let arrayBuffer: ArrayBuffer;
+        if (data instanceof Blob) {
+          arrayBuffer = await data.arrayBuffer();
+        } else if (data instanceof Uint8Array) {
+          arrayBuffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+        } else if (data instanceof ArrayBuffer) {
+          arrayBuffer = data;
+        } else {
+          return;
+        }
+
+        if (arrayBuffer.byteLength >= 8) {
+          const dv = new DataView(arrayBuffer);
+          const chunkIndex = dv.getUint32(0, true);
+          const totalChunks = dv.getUint32(4, true);
+          const chunkPayload = arrayBuffer.slice(8);
+
+          this.receivedChunkBuffers.set(chunkIndex, chunkPayload);
 
           const state = useRoomStore.getState();
-          const roomId = state.room?.id || 'unknown';
-          const participantId = state.participantId;
-          const hostId = state.room?.hostId || 'unknown';
-          const fileSize = state.playbackState.fileSize;
+          const fileId = state.playbackState.videoId || state.p2pActiveFileId || 'local-file';
 
-          logLocalFileE2E('[GUEST][CHUNK_RECEIVED]', {
-            chunkIndex: header.index,
-            bytesReceived: uint8Array.byteLength,
-            totalChunks: header.totalChunks,
-            totalBytes: header.size
+          this.listeners.onChunkReceived?.({
+            fileId,
+            chunkIndex,
+            totalChunks,
+            buffer: chunkPayload
           });
 
-          logLocalFileE2E('[GUEST][CHUNK_STORED]', {
-            chunkIndex: header.index,
-            totalChunks: header.totalChunks,
-            totalBytes: header.size
+          const progress = Math.min(100, Math.round((this.receivedChunkBuffers.size / totalChunks) * 100));
+          this.listeners.onTransferProgress?.({
+            fileId,
+            progress,
+            receivedBytes: this.receivedChunkBuffers.size * 65536
           });
-
-          logLocalFileE2E('[GUEST][BUFFER_PROGRESS]', {
-            chunkIndex: header.index,
-            totalChunks: header.totalChunks,
-            bytesReceived: totalReceivedBytes,
-            totalBytes: header.size
-          });
-
-          console.log("[VIDEO_DEBUG][LOCAL][GUEST_CHUNK_RECEIVED]", {
-            chunkIndex: header.index,
-            bytesReceived: uint8Array.byteLength
-          });
-
-          console.log("[VIDEO_DEBUG][LOCAL][GUEST_PROGRESS]", {
-            receivedBytes: totalReceivedBytes,
-            expectedBytes: header.size,
-            percentage: Math.round((totalReceivedBytes / header.size) * 100)
-          });
-
-          console.log("[VIDEO_DEBUG][GUEST][CHUNK_RECEIVED]", {
-            roomId,
-            senderId,
-            targetId: participantId,
-            hostId,
-            participantId,
-            chunkIndex: header.index,
-            chunkSize: uint8Array.byteLength,
-            fileSize
-          });
-
-          console.log("[VIDEO_DEBUG][GUEST][TOTAL_BYTES]", {
-            roomId,
-            senderId,
-            targetId: participantId,
-            hostId,
-            participantId,
-            chunkIndex: header.index,
-            chunkSize: totalReceivedBytes,
-            fileSize
-          });
-
-          console.log("[VIDEO_TRACE][GUEST] CHUNK_RECEIVED", {
-            fileId: header.fileId,
-            index: header.index,
-            totalChunks: header.totalChunks,
-            chunkSize: uint8Array.byteLength
-          });
-
-          console.log("[VIDEO_TRACE][GUEST] TOTAL_BYTES", {
-            fileId: header.fileId,
-            receivedBytes: totalReceivedBytes,
-            expectedSize: header.size
-          });
-
-          if (this.listeners.onChunkReceived) {
-            this.listeners.onChunkReceived({
-              fileId: header.fileId,
-              chunkIndex: header.index,
-              totalChunks: header.totalChunks,
-              buffer: uint8Array.buffer
-            });
-          }
-
-          if (this.listeners.onTransferProgress) {
-            const progress = Math.round((this.receivedChunkBuffers.size / header.totalChunks) * 100);
-            this.listeners.onTransferProgress({
-              fileId: header.fileId,
-              progress,
-              receivedBytes: totalReceivedBytes
-            });
-          }
-        };
-
-        if (data instanceof Blob) {
-          const reader = new FileReader();
-          reader.onload = () => {
-            processBufferAndContinue(reader.result as ArrayBuffer);
-          };
-          reader.readAsArrayBuffer(data);
-        } else if (data instanceof Uint8Array) {
-          const slice = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
-          processBufferAndContinue(slice);
-        } else if (data instanceof ArrayBuffer) {
-          processBufferAndContinue(data);
-        } else {
-          console.error("Unsupported binary type received on WebRTC data channel:", data);
         }
+      } catch (err: any) {
+        console.error("Error processing WebRTC binary chunk:", err);
       }
     }
   }
@@ -1235,8 +1064,6 @@ export class MockWebRTCService implements WebRTCService {
     this.dataChannels.clear();
     this.streamingFile = null;
     this.receivedChunkBuffers.clear();
-    this.activeReceiveFileId = null;
-    this.pendingChunkHeader = null;
 
     // Close audio nodes
     this.audioElements.forEach((audio) => {
